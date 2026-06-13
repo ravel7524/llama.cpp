@@ -915,7 +915,11 @@ static void mul_mat_vec_q_switch_ncols_dst(
                     stream);
             } else {
                 if constexpr (type == GGML_TYPE_Q8_0) {
-                    const bool use_low_warps = table_id == MMVQ_PARAMETERS_RDNA3_0 && nrows_x >= MMVQ_Q8_0_LOWM_MIN_NROWS;
+                    const bool use_low_warps =
+                    table_id == MMVQ_PARAMETERS_RDNA3_0 &&
+                    !has_ids &&
+                    !has_fusion &&
+                    nrows_x >= MMVQ_Q8_0_LOWM_MIN_NROWS;
                     if (use_low_warps) {
                         std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
                                                                                 nsamples_dst, warp_size, table_id, false, true);
