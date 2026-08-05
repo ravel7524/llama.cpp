@@ -4,11 +4,10 @@
 		ChatScreenForm,
 		ChatMessages,
 		ChatScreenDragOverlay,
-		ChatScreenProcessingInfo,
+		ChatScreenStreamResumeStatus,
 		ServerLoadingSplash,
 		ChatScreenServerError
 	} from '$lib/components/app';
-	import { setProcessingInfoContext } from '$lib/contexts';
 	import { createAutoScrollController } from '$lib/hooks/use-auto-scroll.svelte';
 	import { useChatScreenActiveModel } from '$lib/hooks/use-chat-screen-active-model.svelte';
 	import { useChatScreenDragAndDrop } from '$lib/hooks/use-chat-screen-drag-and-drop.svelte';
@@ -22,8 +21,7 @@
 		errorDialog,
 		isLoading,
 		isChatStreaming,
-		isEditing,
-		activeProcessingState
+		isEditing
 	} from '$lib/stores/chat.svelte';
 	import {
 		conversationsStore,
@@ -33,19 +31,13 @@
 	import { config } from '$lib/stores/settings.svelte';
 	import { serverLoading, serverError } from '$lib/stores/server.svelte';
 	import { parseFilesToMessageExtras } from '$lib/utils/browser-only';
-	import { onDestroy, onMount } from 'svelte';
+	import { onDestroy, onMount, tick } from 'svelte';
 	import ChatScreenGreeting from './ChatScreenGreeting.svelte';
 	import ChatScreenActionScrollDown from './ChatScreenActionScrollDown.svelte';
 	import ChatScreenDialogsAndAlerts from './ChatScreenDialogsAndAlerts.svelte';
-	import { ROUTES } from '$lib/constants';
+	import { LANDING_SETTLE_MAX_MS, LANDING_STABLE_FRAMES, ROUTES } from '$lib/constants';
 
 	let { showCenteredEmpty = false } = $props();
-
-	setProcessingInfoContext({
-		get showProcessingInfo() {
-			return showProcessingInfo;
-		}
-	});
 
 	let disableAutoScroll = $derived(Boolean(config().disableAutoScroll) || isMobile.current);
 	let isMobileUserScrolledUp = $state(false);
@@ -62,11 +54,6 @@
 	let isServerLoading = $derived(serverLoading());
 	let hasPropsError = $derived(!!serverError());
 	let isCurrentConversationLoading = $derived(isLoading() || isChatStreaming());
-	let showProcessingInfo = $derived(
-		isCurrentConversationLoading ||
-			(config().keepStatsVisible && !!page.params.id) ||
-			activeProcessingState() !== null
-	);
 	let chatFormBottomPosition = $derived.by(() => {
 		if (!isMobile.current) return '1rem';
 		if (device.isStandalone) return '1.5rem';
@@ -139,6 +126,41 @@
 
 		await chatStore.sendMessage(message, result?.extras);
 		return true;
+	}
+
+	let lastScrolledConversationId: string | null = null;
+
+	// Lands at the bottom of a conversation the first time its messages
+	// render, whether the route comes from another conversation or from a
+	// non-conversation route. The page keeps growing after the first pin
+	// without DOM mutations (content-visibility size realizations, syntax
+	// highlight passes), so the instant pin repeats every frame until the
+	// height settles, bailing out on user scroll or conversation change.
+	async function handleMessagesReady(messageCount: number) {
+		if (messageCount === 0) return;
+		const id = activeConversation()?.id ?? null;
+		if (!id || id === lastScrolledConversationId) return;
+		lastScrolledConversationId = id;
+		await tick();
+		autoScroll.scrollToBottom();
+
+		const container = scroll.chatScrollContainer;
+		if (!container) return;
+		const started = performance.now();
+		let stableFrames = 0;
+		let lastHeight = container.scrollHeight;
+		const settle = () => {
+			if (autoScroll.userScrolledUp) return;
+			if (activeConversation()?.id !== id) return;
+			autoScroll.scrollToBottom();
+			const height = container.scrollHeight;
+			stableFrames = height === lastHeight ? stableFrames + 1 : 0;
+			lastHeight = height;
+			if (stableFrames >= LANDING_STABLE_FRAMES) return;
+			if (performance.now() - started > LANDING_SETTLE_MAX_MS) return;
+			requestAnimationFrame(settle);
+		};
+		requestAnimationFrame(settle);
 	}
 
 	function handleSendLikeScroll() {
@@ -259,6 +281,7 @@
 		{#if !isEmpty}
 			<ChatMessages
 				messages={activeMessages()}
+				onMessagesReady={handleMessagesReady}
 				onUserAction={() => {
 					handleSendLikeScroll();
 				}}
@@ -281,6 +304,10 @@
 
 			<ChatScreenServerError />
 
+			{#if page.params.id}
+				<ChatScreenStreamResumeStatus />
+			{/if}
+
 			<div class="pointer-events-none flex flex-col gap-6 items-center w-full">
 				{#if (isMobile.current ? mobileScrollDownHint || isMobileUserScrolledUp : autoScroll.userScrolledUp) && page.url.hash.includes(ROUTES.CHAT) && page.params.id}
 					<ChatScreenActionScrollDown
@@ -292,10 +319,6 @@
 							});
 						}}
 					/>
-				{/if}
-
-				{#if showProcessingInfo}
-					<ChatScreenProcessingInfo />
 				{/if}
 			</div>
 
