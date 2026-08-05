@@ -11,7 +11,10 @@
 #include <condition_variable>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <set>
+#include <string>
+#include <unordered_map>
 
 /**
  * state diagram:
@@ -126,6 +129,61 @@ private:
     // if true, the next get_meta() will trigger a reload of model list
     bool need_reload = false;
 
+    // conv_id -> model name that currently serves its stream session, lets the resumable stream
+    // routes go straight to the owning child instead of polling every one. populated when
+    // proxy_request forwards a POST carrying an X-Conversation-Id. best effort: a stale entry just
+    // makes the child answer not found and the client recovers. owns its lock, one mutex per struct
+    struct conv_model_tracker {
+        // returns the ticket of this registration, 0 when nothing was registered. erasing or
+        // replacing the entry invalidates the ticket, which is how a stop cancels a request
+        // parked in the model load wait
+        uint64_t remember(const std::string & conv_id, const std::string & model) {
+            if (conv_id.empty() || model.empty()) {
+                return 0;
+            }
+            std::lock_guard<std::mutex> lock(mu);
+            uint64_t ticket = next_ticket++;
+            map[conv_id] = { model, ticket };
+            return ticket;
+        }
+
+        // false means a stop erased the entry or a newer request replaced it
+        bool alive(const std::string & conv_id, uint64_t ticket) {
+            std::lock_guard<std::mutex> lock(mu);
+            auto it = map.find(conv_id);
+            return it != map.end() && it->second.ticket == ticket;
+        }
+
+        std::optional<std::string> lookup(const std::string & conv_id) {
+            if (conv_id.empty()) {
+                return std::nullopt;
+            }
+            std::lock_guard<std::mutex> lock(mu);
+            auto it = map.find(conv_id);
+            if (it == map.end()) {
+                return std::nullopt;
+            }
+            return it->second.model;
+        }
+
+        void forget(const std::string & conv_id) {
+            if (conv_id.empty()) {
+                return;
+            }
+            std::lock_guard<std::mutex> lock(mu);
+            map.erase(conv_id);
+        }
+
+      private:
+        struct entry_t {
+            std::string model;
+            uint64_t    ticket;
+        };
+        std::mutex                               mu;
+        uint64_t                                 next_ticket = 1;
+        std::unordered_map<std::string, entry_t> map;
+    };
+
     common_preset_context ctx_preset;
 
     common_params base_params;
@@ -145,6 +203,9 @@ private:
     void notify_sse(const std::string & event, const std::string & model_id, const json & data = nullptr);
 
 public:
+    // conv_id -> model tracker for the resumable stream routes, owns its lock
+    conv_model_tracker conv_models;
+
     server_models(const common_params & params, int argc, char ** argv);
 
     server_response sse; // for real-time updates via SSE endpoint
@@ -205,7 +266,7 @@ public:
     bool ensure_model_ready(const std::string & name);
 
     // proxy an HTTP request to the model instance
-    server_http_res_ptr proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used);
+    server_http_res_ptr proxy_request(const server_http_req & req, const std::string & method, const std::string & name, bool update_last_used, bool detached = false);
 
     // handle message sent from server_child::notify_to_router()
     // raw input must starts with CMD_CHILD_TO_ROUTER_STATE, followed by a JSON string
@@ -268,6 +329,12 @@ struct server_models_routes {
     server_http_context::handler_t get_router_models_sse;
     server_http_context::handler_t post_router_models;
     server_http_context::handler_t del_router_models;
+
+    // router side handlers for the resumable streaming routes. each resolves the child that owns
+    // a conversation through the conv_id -> model map, no probing or fan out
+    server_http_context::handler_t router_stream_get;
+    server_http_context::handler_t router_streams_lookup;
+    server_http_context::handler_t router_stream_delete;
 };
 
 /**
