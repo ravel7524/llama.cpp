@@ -952,7 +952,7 @@ static __global__ void mul_mat_q(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx) {
+        const uint3 ntx, const int2 * __restrict__ tile_list) {
 
     // Skip unused template specializations for faster compilation:
     if (ggml_cuda_mmq_get_config(type, J, fallback).type == GGML_TYPE_COUNT) {
@@ -984,10 +984,25 @@ static __global__ void mul_mat_q(
     __syncthreads();
 
     if constexpr (!ggml_cuda_mmq_get_stream_k(type, J, fallback)) {
-        const uint2 tmp2 = fast_div_modulo(blockIdx.z, nchannels_y);
-        const int wt = tmp2.x;
-        const int zt = tmp2.y;
-        const int jt = blockIdx.y;
+        int wt;
+        int zt;
+        int jt;
+        if (tile_list) {
+            // Compacted routed dispatch: blockIdx.y indexes tiles that have work rather than the
+            // widest-expert column tile, so no block is launched only to return at the check below.
+            const int2 tile = tile_list[blockIdx.y]; // {expert, column tile}, negative means no work
+            if (tile.x < 0) {
+                return;
+            }
+            wt = blockIdx.z;
+            zt = tile.x;
+            jt = tile.y;
+        } else {
+            const uint2 tmp2 = fast_div_modulo(blockIdx.z, nchannels_y);
+            wt = tmp2.x;
+            zt = tmp2.y;
+            jt = blockIdx.y;
+        }
         const int it = blockIdx.x;
 
         // Defaults for regular matrix multiplication:
@@ -1368,6 +1383,48 @@ static __global__ void mul_mat_q_stream_k_fixup(
     }
 }
 
+// Builds the compacted list of (expert, column tile) pairs that actually have work.
+// Runs once per matrix multiplication with a single block; the number of experts is small.
+static __global__ void mmq_build_tile_list(
+        const int32_t * __restrict__ expert_bounds, int2 * __restrict__ tile_list,
+        const int nexperts, const int ntiles_max, const int J) {
+    extern __shared__ int tiles_cumulative[];
+
+    for (int e = threadIdx.x; e < nexperts; e += blockDim.x) {
+        const int ncols_expert = expert_bounds[e + 1] - expert_bounds[e];
+        tiles_cumulative[e] = (ncols_expert + J - 1) / J;
+    }
+    __syncthreads();
+
+    // Exclusive prefix sum, serial in a single thread: nexperts is orders of magnitude smaller
+    // than the number of tiles this kernel saves, so a parallel scan would not pay for itself.
+    if (threadIdx.x == 0) {
+        int acc = 0;
+        for (int e = 0; e < nexperts; ++e) {
+            const int ntiles_expert = tiles_cumulative[e];
+            tiles_cumulative[e] = acc;
+            acc += ntiles_expert;
+        }
+        tiles_cumulative[nexperts] = acc;
+    }
+    __syncthreads();
+
+    const int ntiles_total = tiles_cumulative[nexperts];
+
+    for (int e = threadIdx.x; e < nexperts; e += blockDim.x) {
+        const int offset        = tiles_cumulative[e];
+        const int ntiles_expert = tiles_cumulative[e + 1] - offset;
+        for (int t = 0; t < ntiles_expert; ++t) {
+            tile_list[offset + t] = make_int2(e, t);
+        }
+    }
+
+    // The grid is sized from a host-computable upper bound, so mark the surplus entries as empty.
+    for (int i = ntiles_total + threadIdx.x; i < ntiles_max; i += blockDim.x) {
+        tile_list[i] = make_int2(-1, -1);
+    }
+}
+
 struct mmq_args {
     const char * x; ggml_type type_x; const int * y; const int32_t * ids_dst; const int32_t * expert_bounds; float * dst;
     const float * y_scale;
@@ -1419,12 +1476,34 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
     if (!ggml_cuda_mmq_get_stream_k(type, J, fallback, cc)) {
-        mul_mat_q<type, J, fallback><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
+        // For routed matrix multiplications the column count per expert is only known on the device,
+        // so the grid has to be sized for the widest possible expert: ntx*ntzw blocks, even though
+        // the experts together cover at most ceil(ncols_dst/J) + nchannels_y column tiles. Every
+        // surplus block still launches, reads expert_bounds and returns. That bound is computable on
+        // the host, so build the list of (expert, column tile) pairs that have work on the device and
+        // index it with blockIdx.y instead.
+        const int ntiles_max = int((args.ncols_dst + config.J - 1) / config.J) + int(args.nchannels_y);
+        const size_t nbytes_shared_build = (args.nchannels_y + 1)*sizeof(int);
+        const bool use_tile_list = args.ids_dst && args.expert_bounds &&
+            ntiles_max < ntx*ntzw &&
+            nbytes_shared_build <= ggml_cuda_info().devices[id].smpb;
+
+        ggml_cuda_pool_alloc<int2> tile_list(ctx.pool(id));
+        dim3 block_nums_tiling = block_nums_xy_tiling;
+        if (use_tile_list) {
+            tile_list.alloc(ntiles_max);
+            mmq_build_tile_list<<<1, 256, nbytes_shared_build, stream>>>
+                (args.expert_bounds, tile_list.ptr, int(args.nchannels_y), ntiles_max, config.J);
+            CUDA_CHECK(cudaGetLastError());
+            block_nums_tiling = dim3(nty, ntiles_max, args.nsamples_y);
+        }
+
+        mul_mat_q<type, J, fallback><<<block_nums_tiling, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd);
+             ntx_fd, use_tile_list ? tile_list.ptr : nullptr);
         return;
     }
 
@@ -1453,7 +1532,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-         ntx_fd);
+         ntx_fd, nullptr);
 
     if (!fixup_needed) {
         return;
