@@ -4719,7 +4719,8 @@ vk_device ggml_vk_get_device(size_t idx) {
                            (vk::ComponentTypeKHR)prop.CType      == vk::ComponentTypeKHR::eSint32 &&
                            (vk::ComponentTypeKHR)prop.ResultType == vk::ComponentTypeKHR::eSint32 &&
                            (vk::ScopeKHR)prop.scope == vk::ScopeKHR::eSubgroup &&
-                           device->coopmat_int_m == 0
+                           device->coopmat_int_m == 0 &&
+                           !getenv("GGML_VK_DISABLE_COOPMAT_INT")
                 ) {
                     device->coopmat_int_support = true;
                     device->coopmat_int_m = prop.MSize;
