@@ -1,5 +1,10 @@
 #version 450
 
+#if RMS_NORM_QFOLD && defined(QFOLD_SUBGROUPS)
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#endif
+
 #include "generic_binary_head.glsl"
 #include "types.glsl"
 
@@ -49,6 +54,12 @@ layout (constant_id = 2) const bool do_post_multiply = false;
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 shared FLOAT_TYPE sumsh[BLOCK_SIZE];
+
+#if RMS_NORM_QFOLD
+#define QFOLD_BINDING 3
+#define QFOLD_WG BLOCK_SIZE
+#include "qfold_store.glsl"
+#endif
 
 void rms_norm(uint num_iters) {
     const uint ncols     = p.ne00;
@@ -104,6 +115,25 @@ void rms_norm(uint num_iters) {
             const FLOAT_TYPE scale = inversesqrt(mean + FLOAT_TYPE(p.param1));
 
             if (do_multiply) {
+#if RMS_NORM_QFOLD
+                // q8_1 quantize fold: 4 columns per invocation; ncols % 128 == 0 (host check), so a block is all valid or all invalid
+                const uint q_row = ((samp*nchannels + channel)*nrows + row)*ncols;
+                const uint qt = qfold_tid();
+                for (uint c0 = 0; c0 < ncols; c0 += BLOCK_SIZE * 4) {
+                    const uint col = c0 + qt * 4;
+                    const bool valid = col < ncols;
+                    vec4 v = vec4(0.0f);
+                    if (valid) {
+                        [[unroll]] for (uint j = 0; j < 4; ++j) {
+                            const uint bcol = ncols > p.ne10 ? fastmod(col + j, p.ne10) : col + j;
+                            const FLOAT_TYPE value = scale * FLOAT_TYPE(data_a[a_offset + col + j]) * FLOAT_TYPE(data_b[b_offset + bcol]);
+                            data_d[d_offset + col + j] = D_TYPE(value);
+                            v[j] = float(D_TYPE(value));
+                        }
+                    }
+                    qfold_store(v, valid, (q_row + col) / 32, qt);
+                }
+#else
                 if (ncols > p.ne10) {
                     [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
                         if (col >= ncols) {
@@ -133,6 +163,7 @@ void rms_norm(uint num_iters) {
                         data_d[d_offset + col] = D_TYPE(value);
                     }
                 }
+#endif
             } else {
                 [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
                     if (col >= ncols) {

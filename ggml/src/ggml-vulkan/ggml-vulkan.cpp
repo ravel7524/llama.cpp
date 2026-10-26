@@ -3258,6 +3258,17 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_f32, "rms_norm_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_f32, "rms_norm_mul_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true);
+    if (device->integer_dot_product) {
+        // q8_1 quantize fold: binding 3 is the q8_1 x4 output; the subgroup variants need full subgroups, like quantize_q8_1_x4_subgroup
+        const bool qfold_subgroups = device->subgroup_clustered && device->subgroup_require_full_support;
+        if (qfold_subgroups) {
+            ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_qfold_f32, "rms_norm_mul_qfold_subgroup_f32", rms_norm_mul_qfold_subgroup_f32_len, rms_norm_mul_qfold_subgroup_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true, true);
+            ggml_vk_create_pipeline(device, device->pipeline_swiglu_qfold_f32, "swiglu_qfold_subgroup_f32", swiglu_qfold_subgroup_f32_len, swiglu_qfold_subgroup_f32_data, "main", 4, sizeof(vk_op_glu_push_constants), {512, 1, 1}, {}, 1, true, true);
+        } else {
+            ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_qfold_f32, "rms_norm_mul_qfold_f32", rms_norm_mul_qfold_f32_len, rms_norm_mul_qfold_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true);
+            ggml_vk_create_pipeline(device, device->pipeline_swiglu_qfold_f32, "swiglu_qfold_f32", swiglu_qfold_f32_len, swiglu_qfold_f32_data, "main", 4, sizeof(vk_op_glu_push_constants), {512, 1, 1}, {}, 1, true);
+        }
+    }
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_f32, "rms_norm_mul_add_f32", rms_norm_mul_add_f32_len, rms_norm_mul_add_f32_data, "main", 5, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_mul_f32, "rms_norm_mul_add_mul_f32", rms_norm_mul_add_f32_len, rms_norm_mul_add_f32_data, "main", 5, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 1}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_partials_f32, "rms_norm_mul_add_partials_f32", rms_norm_mul_add_partials_f32_len, rms_norm_mul_add_partials_f32_data, "main", 6, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0}, 1, true);
@@ -9777,6 +9788,9 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             if (op == GGML_OP_CONCAT && ggml_is_quantized(dst->type)) {
                 ne = ne / ggml_blck_size(dst->type) * ggml_type_size(dst->type) / ggml_vk_concat_unit_size(dst->type);
             }
+            if (op == GGML_OP_GLU && ctx->qfold_y.buffer) {
+                ne /= 4;  // swiglu_qfold: 4 dst elements per invocation
+            }
             // copy_to_quant has block size of 32, and each thread does QUANT_K elements.
             // Splitting into 512x512xZ wouldn't work well since each workgroup does 1024 elements.
             // So divide by block size here before splitting into 512x512 groups.
@@ -9851,13 +9865,19 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         vk_subbuffer a_buf = src0_buf;
         if (ctx->do_add_rms_partials) {
             a_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_add_rms_partials, ctx->prealloc_size_add_rms_partials_offset);
+        } else if (ctx->qfold_y.buffer) {
+            a_buf = ctx->qfold_y;  // rms_norm_mul_qfold writes the q8_1 x4 blocks here
         }
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
             { src0_buf, src1_buf, dst_buf, a_buf }, pc, elements);
     } else if (op == GGML_OP_GLU) {
         // Empty src1 is possible in glu, but the shader needs a buffer
         vk_subbuffer subbuf1 = use_src1 ? src1_buf : src0_buf;
-        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, subbuf1, dst_buf }, pc, elements);
+        if (ctx->qfold_y.buffer) {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, subbuf1, dst_buf, ctx->qfold_y }, pc, elements);
+        } else {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, subbuf1, dst_buf }, pc, elements);
+        }
     } else if (op == GGML_OP_SOFT_MAX) {
         // Empty src1 and src2 is possible in soft_max, but the shader needs a buffer
         vk_subbuffer subbuf1 = use_src1 ? src1_buf : src0_buf;
@@ -10885,6 +10905,87 @@ static vk_op_rope_push_constants ggml_vk_make_rope_constants(const ggml_tensor *
     return rope;
 }
 
+// q8_1 quantize fold: if all consumers of t read it through MMVQ, the producer also writes the q8_1 x4 blocks and sets the prealloc_y tag, so the consumers skip the quantize
+// the graph is not changed; a consumer that does not find the tag quantizes t as before
+static bool ggml_vk_qfold_consumer_ok(ggml_backend_vk_context * ctx, const ggml_tensor * t, const ggml_tensor * mm) {
+    const ggml_tensor * a = mm->src[0];
+    if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != t || a == t || !ggml_is_quantized(a->type) || !ggml_vk_src1_prec_allows_q8(mm)) {
+        return false;
+    }
+    // the routing of ggml_vk_mul_mat to ggml_vk_mul_mat_vec_q_f16: no M split, no FWHT, a mat-vec batch shape
+    if (mm->ne[2] == 1 && mm->ne[3] == 1 && ggml_nbytes(a) > ctx->device->properties.limits.maxStorageBufferRange) {
+        return false;
+    }
+    if (ggml_vk_can_use_fwht(ctx, t, mm)) {
+        return false;
+    }
+    if (!(mm->ne[1] == 1 || (mm->ne[1] <= mul_mat_vec_max_cols && t->ne[2] * t->ne[3] == 1))) {
+        return false;
+    }
+    // quantize_y in ggml_vk_mul_mat_vec_q_f16 (t is a contiguous f32 tensor, checked by the caller)
+    const uint32_t ne00 = (uint32_t)a->ne[0];
+    const uint32_t ne01 = (uint32_t)a->ne[1];
+    const uint32_t ne10 = (uint32_t)t->ne[0];
+    const uint32_t ne11 = (uint32_t)t->ne[1];
+    if ((uint64_t(ne11) * ne10) % 4 != 0 || !ggml_vk_should_use_mmvq(ctx->device, ne01, ne11, ne10, a->type)) {
+        return false;
+    }
+    return ggml_vk_get_dequantize_mul_mat_vec(ctx, a->type, GGML_TYPE_Q8_1, ne11, (uint32_t)mm->ne[0], ne00) != nullptr;
+}
+
+static bool ggml_vk_qfold_eligible(ggml_backend_vk_context * ctx, const ggml_cgraph * cgraph, int t_idx) {
+    const ggml_tensor * t = cgraph->nodes[t_idx];
+    if (ctx->device->disable_fusion || !ctx->device->integer_dot_product || ctx->device->mmvq_mode == -1) {
+        return false;
+    }
+    // ne[0] % 128: rows are whole x4 groups, so no zero padding is written and a block never straddles two rows
+    if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t) || t->view_src != nullptr || t->ne[0] % 128 != 0 ||
+        t->ne[1] < 1 || t->ne[1] > mul_mat_vec_max_cols || t->ne[2] * t->ne[3] != 1) {
+        return false;
+    }
+    // every use of t (views included) must be found in the next nodes of this graph and be an MMVQ consumer
+    const int32_t n_uses = ggml_node_get_use_count(cgraph, t_idx);
+    if (n_uses < 1) {
+        return false;
+    }
+    int32_t found = 0;
+    for (int i = t_idx + 1; i < cgraph->n_nodes && i <= t_idx + 128 && found < n_uses; ++i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (n->src[s] == t) {
+                if (!ggml_vk_qfold_consumer_ok(ctx, t, n)) {
+                    return false;
+                }
+                found++;
+            }
+        }
+    }
+    return found == n_uses;
+}
+
+// sized and synchronized as the consumers' quantize would do it
+static vk_subbuffer ggml_vk_qfold_begin(ggml_backend_vk_context * ctx, vk_context & subctx, const ggml_tensor * t) {
+    const uint64_t y_sz = ggml_vk_align_size(ggml_nelements(t), 128) * ggml_type_size(GGML_TYPE_Q8_1) / ggml_blck_size(GGML_TYPE_Q8_1);
+    if (ctx->prealloc_size_y < y_sz) {
+        ctx->prealloc_size_y = y_sz;
+        ggml_vk_preallocate_buffers(ctx, subctx);
+    }
+    if (ctx->prealloc_y_need_sync) {
+        ggml_vk_sync_buffers(ctx, subctx);
+    }
+    return { ctx->prealloc_y, 0, ctx->prealloc_y->size };
+}
+
+// tag prealloc_y as the consumers' quantize would; fused_name makes the fold visible in GGML_VK_PERF_LOGGER
+static void ggml_vk_qfold_end(ggml_backend_vk_context * ctx, const ggml_tensor * t, const char * fused_name) {
+    ctx->prealloc_y_last_pipeline_used = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1).get();
+    ctx->prealloc_y_last_tensor_used = t;
+    ctx->prealloc_y_last_k_padded = false;
+    ctx->prealloc_y_need_sync = true;
+    ctx->qfold_y = {};
+    ctx->qfold_fused_name = fused_name;
+}
+
 static void ggml_vk_rms_norm_finish(ggml_backend_vk_context * ctx, const ggml_tensor * src0) {
     if (ctx->do_add_rms_partials_offset_calculation) {
         ctx->prealloc_size_add_rms_partials_offset += ggml_vk_rms_partials_size(ctx, src0);
@@ -11071,7 +11172,16 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
             }, pc, elements);
     } else {
         GGML_ASSERT(ctx->fused_rms_norm_mode == RMS_NORM_MUL || ctx->fused_rms_norm_mode == RMS_NORM_COUNT);
-        ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_RMS_NORM, std::move(bin));
+        vk_pipeline qfold = nullptr;
+        if (ctx->fused_rms_norm_mode == RMS_NORM_MUL && ctx->num_additional_fused_ops == 1 && !ctx->do_add_rms_partials &&
+            ggml_vk_qfold_eligible(ctx, cgraph, node_idx + 1)) {
+            qfold = ctx->device->pipeline_rms_norm_mul_qfold_f32;
+            ctx->qfold_y = ggml_vk_qfold_begin(ctx, subctx, dst);
+        }
+        ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_RMS_NORM, std::move(bin), qfold);
+        if (qfold) {
+            ggml_vk_qfold_end(ctx, dst, "RMS_NORM_MUL_Q8_1");
+        }
     }
 
     ggml_vk_rms_norm_finish(ctx, src0);
@@ -11103,7 +11213,7 @@ void ggml_vk_xielu(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml
     ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_UNARY, std::move(p));
 }
 
-void ggml_vk_glu(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+void ggml_vk_glu(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const ggml_cgraph * cgraph, int node_idx) {
     const float * op_params_f = (const float *)dst->op_params;
 
     const bool swapped = (bool)dst->op_params[1];
@@ -11123,6 +11233,13 @@ void ggml_vk_glu(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_t
     const uint32_t src0_type_size = ggml_type_size(src0->type);
     const uint32_t src1_type_size = split ? ggml_type_size(src1->type) : src0_type_size;
     const uint32_t dst_type_size  = ggml_type_size(dst->type);
+
+    vk_pipeline qfold = nullptr;
+    if (cgraph != nullptr && ggml_get_glu_op(dst) == GGML_GLU_OP_SWIGLU && src0->type == GGML_TYPE_F32 &&
+        dst->type == GGML_TYPE_F32 && ctx->num_additional_fused_ops == 0 && ggml_vk_qfold_eligible(ctx, cgraph, node_idx)) {
+        qfold = ctx->device->pipeline_swiglu_qfold_f32;
+        ctx->qfold_y = ggml_vk_qfold_begin(ctx, subctx, dst);
+    }
 
     ggml_vk_op_f32<vk_op_glu_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_GLU,
         {
@@ -11148,7 +11265,10 @@ void ggml_vk_glu(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_t
             (uint32_t)dst->ne[2],
             0,
             0, 0, 0, 0, 0, 0,
-        });
+        }, qfold);
+    if (qfold) {
+        ggml_vk_qfold_end(ctx, dst, "SWIGLU_Q8_1");
+    }
 }
 
 void ggml_vk_diag_mask_inf(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
@@ -12688,7 +12808,7 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
         case GGML_GLU_OP_GEGLU_ERF:
         case GGML_GLU_OP_GEGLU_QUICK:
         case GGML_GLU_OP_SWIGLU_CLAMP:
-            ggml_vk_glu(ctx, compute_ctx, src0, src1, node);
+            ggml_vk_glu(ctx, compute_ctx, src0, src1, node, cgraph, node_idx);
             break;
         default:
             return false;
@@ -14750,6 +14870,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                       (almost_ready && !ctx->almost_ready_fence_pending);
 
         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
+        if (ctx->qfold_fused_name) {
+            fusion_string = ctx->qfold_fused_name;
+            ctx->qfold_fused_name = nullptr;
+        }
 
         if (vk_perf_logger_enabled && enqueued) {
             compute_ctx = ggml_vk_get_compute_ctx(ctx);

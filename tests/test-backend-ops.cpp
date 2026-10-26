@@ -4068,6 +4068,83 @@ struct test_rms_norm_mul_add : public test_case {
     }
 };
 
+// a producer (RMS_NORM + MUL or SWIGLU) feeding n_cons MUL_MATs as src1; extra = 1 adds a non-matmul use, extra = 2 an F16 consumer (no fold in both)
+struct test_qfold : public test_case {
+    const int producer; // 0 rms_norm * w, 1 swiglu split, 2 swiglu single
+    const ggml_type type_w;
+    const int64_t k, m, n;
+    const int n_cons;
+    const int extra;
+    const ggml_prec prec1;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "QFOLD";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR7(producer, type_w, k, m, n, n_cons, extra) + (prec1 == GGML_PREC_UNDEFINED ? "" : ",prec1=" + std::to_string(prec1));
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_qfold(int producer = 0, ggml_type type_w = GGML_TYPE_Q8_0, int64_t k = 256, int64_t m = 64, int64_t n = 4,
+            int n_cons = 2, int extra = 0, ggml_prec prec1 = GGML_PREC_UNDEFINED)
+        : producer(producer), type_w(type_w), k(k), m(m), n(n), n_cons(n_cons), extra(extra), prec1(prec1) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * t = nullptr;
+        if (producer == 0) {
+            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+            ggml_tensor * g = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+            ggml_set_name(x, "x");
+            ggml_set_name(g, "g");
+            t = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), g);
+        } else if (producer == 1) {
+            ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+            ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+            ggml_set_name(a, "a");
+            ggml_set_name(b, "b");
+            t = ggml_swiglu_split(ctx, a, b);
+        } else {
+            ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*k, n);
+            ggml_set_name(a, "a");
+            t = ggml_swiglu(ctx, a);
+        }
+        ggml_set_name(t, "t");
+
+        ggml_tensor * out = nullptr;
+        for (int i = 0; i < n_cons; ++i) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, type_w, k, m);
+            ggml_tensor * y = ggml_mul_mat(ctx, w, t);
+            // Constrain the last consumer so mixed cases check every use of the producer.
+            if (i == n_cons - 1) {
+                ggml_prec_set_src(y, prec1, 1);
+            }
+            out = out ? ggml_add(ctx, out, y) : y;
+        }
+        if (extra == 1) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, type_w, k, m);
+            out = ggml_add(ctx, out, ggml_mul_mat(ctx, w, ggml_scale(ctx, t, 0.5f)));
+        } else if (extra == 2) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, m);
+            out = ggml_add(ctx, out, ggml_mul_mat(ctx, w, t));
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -1.f, 1.f);
+        }
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_ADD (fused residual chain)
 struct test_add_add : public test_case {
     const ggml_type type;
@@ -10913,6 +10990,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false, multi_add));
         }
         test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false));
+    }
+    // q8_1 quantize fold: fold-eligible shapes (k % 128 == 0, n <= 8), and ineligible ones as controls
+    for (int producer : {0, 1, 2}) {
+        for (int64_t n : {1, 2, 3, 4, 5, 8}) {
+            test_cases.emplace_back(new test_qfold(producer, GGML_TYPE_Q8_0, 256, 64, n, 2, 0));
+        }
+        test_cases.emplace_back(new test_qfold(producer, GGML_TYPE_Q8_0, 256, 64, 4, 1, 0));
+        test_cases.emplace_back(new test_qfold(producer, GGML_TYPE_Q8_0, 256, 64, 4, 4, 0));
+        test_cases.emplace_back(new test_qfold(producer, GGML_TYPE_Q8_0, 5120, 48, 4, 4, 0));
+        test_cases.emplace_back(new test_qfold(producer, GGML_TYPE_Q4_K, 512, 64, 4, 2, 0));
+        test_cases.emplace_back(new test_qfold(producer, GGML_TYPE_Q8_0, 96, 64, 4, 2, 0));   // k % 128 != 0: no fold
+        test_cases.emplace_back(new test_qfold(producer, GGML_TYPE_Q8_0, 256, 64, 9, 2, 0));  // n > 8: no fold
+        test_cases.emplace_back(new test_qfold(producer, GGML_TYPE_Q8_0, 256, 64, 4, 2, 1));  // extra use: no fold
+        test_cases.emplace_back(new test_qfold(producer, GGML_TYPE_Q8_0, 256, 64, 4, 2, 2));  // f16 consumer: no fold
+        for (ggml_prec prec1 : {GGML_PREC_F16, GGML_PREC_BF16}) {
+            for (int64_t n : {2, 8}) {
+                for (int n_cons : {1, 2}) {
+                    test_cases.emplace_back(new test_qfold(producer, GGML_TYPE_Q8_0, 256, 64, n, n_cons, 0, prec1));
+                }
+            }
+        }
     }
     for (uint32_t n : {64, 1025}) {
         test_cases.emplace_back(new test_add_add(GGML_TYPE_F32, GGML_TYPE_F32, { n, 5, 4, 3 }, false, false));

@@ -850,6 +850,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_group_norm_f32;
     vk_pipeline pipeline_rms_norm_f32;
     vk_pipeline pipeline_rms_norm_mul_f32;
+    vk_pipeline pipeline_rms_norm_mul_qfold_f32;
+    vk_pipeline pipeline_swiglu_qfold_f32;
     vk_pipeline pipeline_rms_norm_mul_add_f32;
     vk_pipeline pipeline_rms_norm_mul_add_mul_f32;
     vk_pipeline pipeline_rms_norm_mul_add_partials_f32;
@@ -1244,6 +1246,10 @@ struct ggml_backend_vk_context {
     const ggml_tensor * prealloc_y_last_tensor_used {};
     // True when the K dimension in prealloc_y is padded.
     bool prealloc_y_last_k_padded {};
+    // q8_1 quantize fold: set around one producer dispatch; ggml_vk_op_f32 binds it as the q8_1 x4 output
+    vk_subbuffer qfold_y {};
+    // set when the last built node folded the quantize; the perf logger name for that dispatch
+    const char * qfold_fused_name {};
 
     // Track which nodes have been used since the last sync, and whether they were written to
     std::vector<const ggml_tensor *> unsynced_nodes_written;
