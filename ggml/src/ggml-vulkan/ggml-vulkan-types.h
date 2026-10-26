@@ -538,6 +538,9 @@ static constexpr std::initializer_list<ggml_op> rms_norm_view_set_rows_pattern {
 
 static constexpr std::initializer_list<ggml_op> rope_view_set_rows_pattern { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS };
 
+// GATED_DELTA_NET + the CPY of its state snapshots into the recurrent cache: the kernel stores the snapshots and the CPY is elided
+static constexpr std::initializer_list<ggml_op> gdn_cache_cpy_pattern { GGML_OP_GATED_DELTA_NET, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_CPY };
+
 // scale_out*sigmoid(scale_in*x) as the hc_post weights (qwen4exp hc_combine)
 static constexpr std::initializer_list<ggml_op> hc_post_gate_pattern { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST };
 
@@ -969,6 +972,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_lightning_indexer_f32[GGML_TYPE_COUNT];
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
     vk_pipeline pipeline_gated_delta_net[4][2];
+    // the same with the snapshot stores going to the recurrent cache (binding 7)
+    vk_pipeline pipeline_gated_delta_net_cache[4][2];
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
@@ -1287,6 +1292,8 @@ struct ggml_backend_vk_context {
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
+    // cache view the fused GATED_DELTA_NET writes its state snapshots into (nullptr = not fused)
+    const ggml_tensor * fused_gdn_cache_view {};
 
     // for GGML_VK_PERF_LOGGER
     std::unique_ptr<vk_perf_logger> perf_logger;

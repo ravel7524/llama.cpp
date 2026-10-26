@@ -3714,15 +3714,24 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const bool use_subgroup_ops = use_clustered_reduce || use_subgroup_reduce;
             size_t gdn_len;
             const void * gdn_data;
+            // matching gated_delta_net_cache variant (snapshots stored into the recurrent cache)
+            size_t gdn_cache_len;
+            const void * gdn_cache_data;
             if (use_clustered_reduce) {
                 gdn_len = gated_delta_net_f32_len;
                 gdn_data = (const void *)gated_delta_net_f32_data;
+                gdn_cache_len = gated_delta_net_cache_f32_len;
+                gdn_cache_data = (const void *)gated_delta_net_cache_f32_data;
             } else if (use_subgroup_reduce) {
                 gdn_len = gated_delta_net_f32_nocluster_len;
                 gdn_data = (const void *)gated_delta_net_f32_nocluster_data;
+                gdn_cache_len = gated_delta_net_cache_f32_nocluster_len;
+                gdn_cache_data = (const void *)gated_delta_net_cache_f32_nocluster_data;
             } else {
                 gdn_len = gated_delta_net_f32_shmem_len;
                 gdn_data = (const void *)gated_delta_net_f32_shmem_data;
+                gdn_cache_len = gated_delta_net_cache_f32_shmem_len;
+                gdn_cache_data = (const void *)gated_delta_net_cache_f32_shmem_data;
             }
 
             const uint32_t cols_per_wg = gdn_subgroup_size / lanes_per_column;
@@ -3731,6 +3740,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             for (uint32_t kda = 0; kda < 2; kda++) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
                     gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
+                    wg_denoms, {S_V, kda, gdn_subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, gdn_subgroup_size);
+                const std::string cache_name = std::string("gated_delta_net_cache") + (gdn_names[si][kda] + strlen("gated_delta_net"));
+                ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_cache[si][kda],
+                    cache_name.c_str(), gdn_cache_len, gdn_cache_data, "main", 8, sizeof(vk_op_gated_delta_net_cache_push_constants),
                     wg_denoms, {S_V, kda, gdn_subgroup_size, lanes_per_column}, 1, true, use_subgroup_ops, gdn_subgroup_size);
             }
         }
@@ -10374,6 +10387,15 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
     vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, dst->src[0], dst->src[1], dst->src[2], dst, dst->op);
     GGML_ASSERT(pipeline != nullptr);
 
+    // fused with the snapshot CPY: the cache variant stores the snapshots into the cache view
+    const ggml_tensor * cache_view = ctx->fused_gdn_cache_view;
+    if (cache_view != nullptr) {
+        const uint32_t si = S_v == 16 ? 0 : S_v == 32 ? 1 : S_v == 64 ? 2 : 3;
+        const uint32_t kda = (dst->src[3]->ne[0] == (int64_t) S_v) ? 1 : 0;
+        GGML_ASSERT(pipeline == ctx->device->pipeline_gated_delta_net[si][kda]);
+        pipeline = ctx->device->pipeline_gated_delta_net_cache[si][kda];
+    }
+
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
@@ -10405,6 +10427,17 @@ void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, 
         scale,
         K
     };
+
+    if (cache_view != nullptr) {
+        // slot s of the snapshot tail goes to rollback group s of the cache view (slot 0 = newest)
+        const vk_op_gated_delta_net_cache_push_constants pc_cache = {
+            pc, K > 1 ? (uint32_t)(cache_view->nb[2] / sizeof(float)) : 0u
+        };
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf, ggml_vk_tensor_subbuffer(ctx, cache_view)},
+            pc_cache, { H, n_seqs, S_v });
+        return;
+    }
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
@@ -14105,6 +14138,78 @@ bool ggml_vk_can_fuse_topk_qsa(ggml_backend_vk_context * ctx, const struct ggml_
     return true;
 }
 
+// GATED_DELTA_NET + VIEW + VIEW + CPY: the kernel stores the state snapshots into the cache view and the CPY is elided (as ggml_cuda_try_gdn_cache_fusion)
+static const ggml_tensor * ggml_vk_can_fuse_gdn_cache(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    // the gdn output (attention scores) and the cache view are read outside the pattern; the tail view must feed only the cpy
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, gdn_cache_cpy_pattern, { node_idx, node_idx + 2, node_idx + 3 })) {
+        return nullptr;
+    }
+    const ggml_tensor * gdn   = cgraph->nodes[node_idx];
+    const ggml_tensor * v_src = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * v_dst = cgraph->nodes[node_idx + 2];
+    const ggml_tensor * cpy   = cgraph->nodes[node_idx + 3];
+    // the kernel skips the snapshot tail, so the gdn output must not be a graph output
+    if (gdn->type != GGML_TYPE_F32 || (gdn->flags & GGML_TENSOR_FLAG_OUTPUT) || cpy->src[0] != v_src || cpy->src[1] != v_dst) {
+        return nullptr;
+    }
+
+    const ggml_tensor * src_v     = gdn->src[2];
+    const int64_t       S_v       = src_v->ne[0];
+    const int64_t       H         = src_v->ne[1];
+    const int64_t       n_tokens  = src_v->ne[2];
+    const int64_t       n_seqs    = src_v->ne[3];
+    const int64_t       D         = S_v * S_v * H;
+    const int64_t       K         = ggml_get_op_params_i32(gdn, 0); // snapshot slot count
+    const int64_t       n_written = std::min<int64_t>(n_tokens, K); // newest n_written slots are written
+    if (S_v != 16 && S_v != 32 && S_v != 64 && S_v != 128) {
+        return nullptr;
+    }
+
+    // src must be this gdn's snapshot tail (contiguous, right after the attention scores)
+    const size_t tail_off = ggml_row_size(GGML_TYPE_F32, S_v * H * n_tokens * n_seqs);
+    if (v_src->view_src != gdn || v_src->view_offs != tail_off || !ggml_is_contiguous(v_src)) {
+        return nullptr;
+    }
+
+    // the fused kernel does not write the snapshot tail: apart from the tail view, readers of the gdn output must use views that end before it
+    for (int i = node_idx + 1; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        if (n == v_src) {
+            continue;
+        }
+        if (n->view_src == gdn && n->view_offs + ggml_nbytes(n) > tail_off) {
+            return nullptr;
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (n->src[s] == gdn && n->view_src != gdn) {
+                return nullptr;
+            }
+        }
+    }
+
+    // dst is the [D, n_seqs, n_written] cache view with the per-seq stride the kernel assumes
+    const std::array<int64_t, GGML_MAX_DIMS> expected_ne = { D, n_seqs, n_written, 1 };
+    if (v_dst->view_src == nullptr || v_dst->buffer == nullptr || v_dst->type != GGML_TYPE_F32 ||
+        !std::equal(expected_ne.begin(), expected_ne.end(), v_dst->ne) ||
+        v_dst->nb[0] != ggml_type_size(GGML_TYPE_F32) || v_dst->nb[1] != (size_t) ggml_row_size(GGML_TYPE_F32, D) ||
+        v_dst->nb[2] % sizeof(float) != 0) {
+        return nullptr;
+    }
+    // the cache view is bound as its own descriptor: its offset must be a valid descriptor offset
+    vk_buffer buf = nullptr;
+    size_t offset = 0;
+    if (ctx->device->uma) {
+        ggml_vk_host_get(ctx->device, v_dst->data, buf, offset);
+    }
+    if (!buf) {
+        offset = vk_tensor_offset(v_dst) + v_dst->view_offs;
+    }
+    if (offset % ctx->device->properties.limits.minStorageBufferOffsetAlignment != 0) {
+        return nullptr;
+    }
+    return v_dst;
+}
+
 // RMS_NORM + SCALE, e.g. the l2 norm of gated delta net models (build_gdn_l2_norm)
 static bool ggml_vk_can_fuse_rms_norm_scale(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
     if (!ggml_vk_can_fuse(ctx, cgraph, node_idx, { GGML_OP_RMS_NORM, GGML_OP_SCALE })) {
@@ -14521,6 +14626,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_qsa = false;
         ctx->fused_hc_post_gate = false;
         ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
+        ctx->fused_gdn_cache_view = nullptr;
         const char *fusion_string {};
         if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
@@ -14582,6 +14688,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->num_additional_fused_ops = hc_post_gate_pattern.size() - 1;
                 ctx->fused_hc_post_gate = true;
                 fusion_string = "HC_POST_GATE";
+                std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
+            } else if (const ggml_tensor * gdn_cache_view = ggml_vk_can_fuse_gdn_cache(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = gdn_cache_cpy_pattern.size() - 1;
+                ctx->fused_gdn_cache_view = gdn_cache_view;
+                // the gdn itself still writes the attention scores that later nodes read
+                ctx->fused_ops_write_mask |= 1 << 0;
+                fusion_string = "GDN_CACHE_CPY";
                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, false);
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, rms_norm_mul_add_mul_pattern)) {
                 ctx->num_additional_fused_ops = 3;
@@ -14770,6 +14883,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->fused_topk_qsa = false;
                 ctx->fused_hc_post_gate = false;
                 ctx->fused_rms_norm_mode = RMS_NORM_COUNT;
+                ctx->fused_gdn_cache_view = nullptr;
                 fusion_string = nullptr;
             }
         }
@@ -14915,6 +15029,8 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
     std::set<ggml_tensor *> used_node_set;
 
     int first_unused = 0;
+    // reorder protection for the GDN cache fusion, only while that fusion can fire
+    const bool gdn_cache_fusion = !ctx->device->disable_fusion;
 
     // scheduled or zero-compute nodes in [lo, hi)
     auto const &empty_or_scheduled_between = [&](int lo, int hi) -> bool {
@@ -14957,6 +15073,35 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             return false;
         };
 
+        // keep a GDN cache-CPY pattern adjacent: its views and CPY are pulled right behind the GDN and stay put until then (the dst view reads only a leaf and would otherwise move ahead)
+        auto const &in_gdn_cache_pattern_interior = [&](int n) -> bool {
+            if (!gdn_cache_fusion) {
+                return false;
+            }
+            for (int o = 1; o < (int) gdn_cache_cpy_pattern.size(); ++o) {
+                if (n - o >= 0 && match_pattern(gdn_cache_cpy_pattern, n - o)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        auto const &pull_gdn_cache_pattern = [&](std::vector<int> &set, int head) {
+            if (!gdn_cache_fusion || !match_pattern(gdn_cache_cpy_pattern, head)) {
+                return;
+            }
+            // the pulled nodes skip the scan below: no earlier unscheduled node may touch their inputs or the cache (zero-sized nodes move no data)
+            for (int o = 1; o < (int) gdn_cache_cpy_pattern.size(); ++o) {
+                for (int c = first_unused; c < head; ++c) {
+                    if (!used[c] && ggml_nelements(graph->nodes[c]) > 0 && is_src_of(graph->nodes[head + o], graph->nodes[c])) {
+                        return;
+                    }
+                }
+            }
+            for (int o = 1; o < (int) gdn_cache_cpy_pattern.size(); ++o) {
+                set.push_back(head + o);
+                used[head + o] = true;
+            }
+        };
         auto const &in_set = [&](const std::vector<int> &set, const ggml_tensor * t) -> bool {
             for (int c : set) {
                 if (graph->nodes[c] == t) {
@@ -15058,6 +15203,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
 
         // First, grab the next unused node.
         current_set.push_back(first_unused);
+        pull_gdn_cache_pattern(current_set, first_unused);
 
         // Loop through the next N nodes. Grab any that don't depend on other nodes that
         // haven't already been run. Nodes that have already been run have used[i] set
@@ -15083,6 +15229,9 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 }
                 return false;
             };
+            if (in_gdn_cache_pattern_interior(j)) {
+                continue;
+            }
             // keep a UNARY next to its MUL (UNARY + MUL fusion): defer it while the MUL still waits for its other operand
             if (graph->nodes[j]->op == GGML_OP_UNARY && unary_mul_partner_waits(current_set, j)) {
                 continue;
@@ -15121,6 +15270,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             }
             if (ok) {
                 current_set.push_back(j);
+                pull_gdn_cache_pattern(current_set, j);
 
                 int rope_idx = j;
 
@@ -15261,6 +15411,9 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                     continue;
                 }
                 if (!is_empty(graph->nodes[j])) {
+                    continue;
+                }
+                if (in_gdn_cache_pattern_interior(j)) {
                     continue;
                 }
                 bool ok = true;

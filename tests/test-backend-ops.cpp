@@ -5291,18 +5291,40 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     const int64_t head_size;
     const int64_t n_seq_tokens;
     const int64_t n_seqs;
-    const int64_t K; // snapshot slot count (>1)
+    const int64_t K; // snapshot slot count
+    const int64_t mem_size; // cache sequence slots (0 -> n_seqs); > n_seqs gives a cache slot stride != the snapshot stride
+    const bool attn_out;    // also read the attention scores after the cpy (checks the fused gdn's own output)
+    // a later reader of the snapshot tail, which a fused gdn does not write: 1 = the whole gdn output, 2 = a view that overlaps the tail
+    const int tail_reader;
+    // an earlier writer of the same cache rows that is not an ancestor of the gdn: the cpy must stay behind it when the graph is reordered
+    const bool early_writer;
 
-    ggml_tensor * cpy_node = nullptr;
+    ggml_tensor * cpy_node    = nullptr;
+    ggml_tensor * attn_node   = nullptr;
+    ggml_tensor * reader_node = nullptr;
 
     std::string vars() override {
-        return VARS_TO_STR6(type, head_count, head_size, n_seq_tokens, n_seqs, K);
+        std::string v = VARS_TO_STR6(type, head_count, head_size, n_seq_tokens, n_seqs, K);
+        if (mem_size != 0) {
+            v += "," + VAR_TO_STR(mem_size);
+        }
+        if (attn_out) {
+            v += "," + VAR_TO_STR(attn_out);
+        }
+        if (tail_reader != 0) {
+            v += "," + VAR_TO_STR(tail_reader);
+        }
+        if (early_writer) {
+            v += "," + VAR_TO_STR(early_writer);
+        }
+        return v;
     }
 
     test_gated_delta_net_cache_fusion(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 32, int64_t n_seq_tokens = 2, int64_t n_seqs = 1,
-            int64_t K = 2)
-        : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K) {}
+            int64_t K = 2, int64_t mem_size = 0, bool attn_out = false, int tail_reader = 0, bool early_writer = false)
+        : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K),
+          mem_size(mem_size), attn_out(attn_out), tail_reader(tail_reader), early_writer(early_writer) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t S_v = head_size;
@@ -5324,8 +5346,24 @@ struct test_gated_delta_net_cache_fusion : public test_case {
         ggml_set_name(beta,  "beta");
         ggml_set_name(state, "state");
 
-        q = ggml_l2_norm(ctx, q, 1e-6f);
-        k = ggml_l2_norm(ctx, k, 1e-6f);
+        // recurrent cache [D, cache_seqs, n_written]; mem_size > n_seqs gives a slot stride of mem_size rows, as in ssm_states_all
+        const int64_t cache_seqs = mem_size > 0 ? mem_size : n_seqs;
+        ggml_tensor * cache = ggml_new_tensor_3d(ctx, type, D, cache_seqs, n_written);
+        ggml_set_name(cache, "cache");
+
+        ggml_tensor * early = nullptr;
+        if (early_writer) {
+            // computed from its own input and copied into the snapshot rows of the cache before the gdn in graph order
+            ggml_tensor * x = ggml_new_tensor_3d(ctx, type, D, n_seqs, n_written);
+            ggml_set_name(x, "x");
+            ggml_tensor * rows = ggml_view_3d(ctx, cache, D, n_seqs, n_written, cache->nb[1], cache->nb[2], 0);
+            early = ggml_cpy(ctx, ggml_scale(ctx, x, 2.0f), rows);
+            ggml_set_name(early, "early_writer");
+        } else {
+            // the early_writer variant keeps q and k leaves so that the gdn is ready as soon as the graph starts
+            q = ggml_l2_norm(ctx, q, 1e-6f);
+            k = ggml_l2_norm(ctx, k, 1e-6f);
+        }
 
         ggml_tensor * gdn_out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
         ggml_set_name(gdn_out, "gdn_out");
@@ -5347,20 +5385,39 @@ struct test_gated_delta_net_cache_fusion : public test_case {
                 ggml_row_size(gdn_out->type, attn_score_elems));
 
         // recurrent cache view [D, n_seqs, n_written]
-        ggml_tensor * cache = ggml_new_tensor_3d(ctx, type, D, n_seqs, n_written);
-        ggml_set_name(cache, "cache");
         ggml_tensor * dst = ggml_view_3d(ctx, cache,
                 D, n_seqs, n_written,
-                ggml_row_size(cache->type, D),
-                ggml_row_size(cache->type, D * n_seqs), 0);
+                cache->nb[1],
+                cache->nb[2], 0);
 
         ggml_tensor * cpy = ggml_cpy(ctx, src, dst);
         ggml_set_name(cpy, "gdn_cache_cpy");
         cpy_node = cpy;
 
         // read the cpy output (not the plain dst view, which would not pull the cpy into the graph)
-        // so that neither the gdn nor the cpy is the graph output
-        ggml_tensor * out = ggml_sum(ctx, cpy);
+        // so that neither the gdn nor the cpy is the graph output; a strided cache view is not contiguous, so reduce its rows first
+        ggml_tensor * out = cache_seqs > n_seqs ? ggml_sum(ctx, ggml_sum_rows(ctx, cpy)) : ggml_sum(ctx, cpy);
+        if (early) {
+            // read the earlier write first (first operand, so before the gdn in graph order); the cpy then overwrites those rows
+            out = ggml_add(ctx, ggml_sum(ctx, cache_seqs > n_seqs ? ggml_sum_rows(ctx, early) : early), out);
+        }
+        if (tail_reader == 1) {
+            reader_node = ggml_scale(ctx, gdn_out, 1.0f);
+        } else if (tail_reader == 2) {
+            // the last attention row plus the first snapshot row
+            const int64_t span = S_v + D;
+            reader_node = ggml_scale(ctx, ggml_view_1d(ctx, gdn_out, span, ggml_row_size(gdn_out->type, attn_score_elems - S_v)), 1.0f);
+        }
+        if (reader_node) {
+            ggml_set_name(reader_node, "tail_read");
+            out = ggml_add(ctx, out, ggml_sum(ctx, reader_node));
+        }
+        if (attn_out) {
+            // a later reader of the attention scores: a fused gdn must still write them, behind a barrier
+            attn_node = ggml_scale(ctx, attn, 1.0f);
+            ggml_set_name(attn_node, "attn_read");
+            out = ggml_add(ctx, out, ggml_sum(ctx, attn_node));
+        }
         return out;
     }
 
@@ -5370,7 +5427,18 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     }
 
     bool run_whole_graph() override { return true; }
-    std::vector<ggml_tensor *> fusion_test_nodes() override { return { cpy_node }; }
+    // the early writer only matters when the graph is reordered
+    bool run_graph_optimize() override { return early_writer; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        std::vector<ggml_tensor *> nodes = { cpy_node };
+        if (attn_node) {
+            nodes.push_back(attn_node);
+        }
+        if (reader_node) {
+            nodes.push_back(reader_node);
+        }
+        return nodes;
+    }
 
     uint64_t op_flops(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -12608,6 +12676,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
+    // qwen35 shapes (H 48, S_v 128, K 4): verify, decode, prefill, two sequences, more cache slots than the batch, K 1, and a reader of the scores after the cpy
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 48, 128,  4, 1, 4));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 48, 128,  1, 1, 4));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 48, 128, 13, 1, 4));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 48, 128,  4, 2, 4));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 48, 128,  4, 2, 4, 4));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 48, 128,  1, 1, 1));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 48, 128,  4, 1, 4, 0, true));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  8,  32,  4, 2, 4, 3, true));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4,  64,  1, 1, 1, 0, true));
+    // a later reader of the snapshot tail (no fusion), and an earlier writer of the same cache rows
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4,  32,  4, 1, 4, 0, false, 1));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4,  32,  4, 1, 4, 0, false, 2));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 48, 128,  4, 1, 4, 0, true,  2));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4,  32,  4, 1, 4, 0, false, 0, true));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 48, 128,  4, 2, 4, 4, false, 0, true));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

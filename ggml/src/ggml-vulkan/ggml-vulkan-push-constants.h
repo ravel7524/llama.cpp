@@ -707,6 +707,13 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t K;
 };
 
+// gated_delta_net_cache pipelines (snapshots stored straight into the recurrent cache)
+struct vk_op_gated_delta_net_cache_push_constants {
+    vk_op_gated_delta_net_push_constants gdn;
+    uint32_t cache_slot_stride; // floats between snapshot slots in the cache view (0 when K == 1)
+};
+static_assert(sizeof(vk_op_gated_delta_net_cache_push_constants) == sizeof(vk_op_gated_delta_net_push_constants) + sizeof(uint32_t));
+
 struct vk_op_ssm_scan_push_constants {
     uint32_t nb02, nb03, nb12, nb13;
     uint32_t nb21, nb22, nb31;
