@@ -411,6 +411,7 @@ enum FaCodePath {
     FA_SCALAR,
     FA_COOPMAT1,
     FA_COOPMAT2,
+    FA_COOPMAT1_DPART, // the d-partitioned mode of flash_attn_cm1.comp (FA_DPART) for small GQA batches
 };
 
 struct vk_fa_pipeline_state {

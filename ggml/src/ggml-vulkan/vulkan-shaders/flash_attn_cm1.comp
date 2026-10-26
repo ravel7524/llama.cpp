@@ -15,12 +15,274 @@
 #extension GL_KHR_shader_subgroup_vote : enable
 #extension GL_KHR_memory_scope_semantics : enable
 #extension GL_KHR_cooperative_matrix : enable
+#if defined(FA_DPART)
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#endif
 
 #include "types.glsl"
 #include "flash_attn_base.glsl"
-#if !defined(BFLOAT16)
+#if !defined(BFLOAT16) && !defined(FA_DPART)
 #include "flash_attn_dequant.glsl"
 #endif
+
+#if defined(FA_DPART)
+// D-partitioned mode for small GQA batches (e.g. speculative decoding verify): one workgroup holds all query rows of one KV head, so each K/V block is read once per KV head, not once per token.
+// Row r is token r / gqa_ratio, head iq2 + r % gqa_ratio. Each subgroup owns a 64-wide d slice in both the QK and the PV phase, and the four partial S slabs are summed in the softmax.
+// The host only selects it for: HSK == HSV == 256, f16 K/V, f32 accumulation, subgroup size 64, at most 32 rows and 8 tokens, a mask shared by all heads, no ALiBi/softcap/sinks/sparse, KV % Bc == 0, split_k > 1.
+
+const uint32_t R   = 32;                        // packed rows (two 16-row halves)
+const uint32_t NSG = WorkGroupSize / SubGroupSize; // 4 subgroups
+const uint32_t DSL = HSV / NSG;                 // d slice per subgroup (64)
+const uint32_t NDC = DSL / 16;                  // 16-wide d chunks per slice (4)
+
+layout (binding = 0) readonly buffer Q   {float   data_q[];};
+layout (binding = 1) readonly buffer KV4 {f16vec4 data_kv4[];};
+layout (binding = 2) readonly buffer VV4 {f16vec4 data_vv4[];};
+layout (binding = 3) readonly buffer M   {float16_t data_m[];};
+
+// One slab per subgroup: its partial S (row-major, 32 x Bc floats), then its V^T slice (DSL rows of Bc + 8 halves, 80 B), then the epilogue staging.
+const uint32_t sstride = Bc + 8;
+shared float ssh[NSG * R * sstride];
+// P, row-major f16
+const uint32_t pstride = Bc + 8;
+shared float16_t psh[R * pstride];
+// per-row rescale factor of the block, and one "a row max moved" flag per subgroup
+shared float eMsh[R];
+shared uint movedsh[NSG];
+// mask rows of this block (<= 8 tokens)
+shared float16_t msh[8 * Bc];
+// element (r, c) of a 16x16 accumulator = r
+shared float rowidx[16 * 16];
+
+void main() {
+    init_indices();
+
+    const uint32_t tid  = gl_LocalInvocationIndex;
+    const uint32_t sg   = gl_SubgroupID;
+    const uint32_t lane = gl_SubgroupInvocationID;
+    const uint32_t G    = p.gqa_ratio;
+    // dst ne2 is the number of query tokens
+    const uint32_t ntok = min(p.ne2, p.nem1);
+    const uint32_t nrow = ntok * G;
+
+    if (tid < 256) {
+        rowidx[tid] = float(tid / 16);
+    }
+
+    const uint32_t k_offset = (ik2 * p.nb12 + ik3 * p.nb13) / FaBlockBytesK;
+    const uint32_t v_offset = (iv2 * p.nb22 + iv3 * p.nb23) / FaBlockBytesV;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> O[2][NDC];
+    [[unroll]] for (uint32_t h = 0; h < 2; ++h) {
+        [[unroll]] for (uint32_t c = 0; c < NDC; ++c) {
+            O[h][c] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        }
+    }
+
+    // softmax ownership: subgroup sg owns rows sg*8 .. sg*8+7, 8 lanes per row, Bc/8 keys per lane
+    const uint32_t my_r = sg * 8 + lane / 8;
+    const uint32_t my_c = lane % 8;
+    const uint32_t KPL = Bc / 8;
+    const float NEG_FLT_MAX_OVER_2 = uintBitsToFloat(0xFEFFFFFF);
+    float Mrow = NEG_FLT_MAX_OVER_2;
+    float Lrow = 0.0;
+
+    // Q^T fragments of this subgroup's d slice stay in registers for the whole loop (staged in f32 through the slab, padded rows are zero)
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> Qb[DSL / 16][2];
+    [[unroll]] for (uint32_t hh = 0; hh < DSL / 32; ++hh) {
+        [[unroll]] for (uint32_t e = 0; e < R * 32 / SubGroupSize; ++e) {
+            const uint32_t idx = e * SubGroupSize + lane;
+            const uint32_t r = idx / 32;
+            const uint32_t d = sg * DSL + hh * 32 + idx % 32;
+            float q = 0.0;
+            if (r < nrow) {
+                q = data_q[(r / G) * p.nb01 + ((iq2 + r % G) * p.nb02 + iq3 * p.nb03) / 4 + d] * p.scale;
+            }
+            ssh[sg * R * sstride + idx] = q;
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+        [[unroll]] for (uint32_t dd = 0; dd < 2; ++dd) {
+            [[unroll]] for (uint32_t nt = 0; nt < 2; ++nt) {
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> qt;
+                coopMatLoad(qt, ssh, sg * R * sstride + nt * 16 * 32 + dd * 16, 32, gl_CooperativeMatrixLayoutColumnMajor);
+                Qb[hh * 2 + dd][nt] = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>(qt);
+            }
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+    }
+    barrier();
+
+    [[dont_unroll]]
+    for (uint32_t j = start_j; j < end_j; ++j) {
+        // one mask row per token
+        if (MASK_ENABLE) {
+            [[unroll]] for (uint32_t idx = 0; idx < 8 * Bc; idx += WorkGroupSize) {
+                const uint32_t t = (idx + tid) / Bc;
+                const uint32_t c = (idx + tid) % Bc;
+                float16_t mv = float16_t(0.0);
+                if (t < ntok) {
+                    mv = data_m[t * KV + j * Bc + c];
+                }
+                msh[idx + tid] = mv;
+            }
+        }
+
+        // load this subgroup's V slice now (keys 2*vkf .. 2*vkf+7, d vd0 .. vd0+3 per lane), packed as V^T words; it is written to the slab after the softmax
+        const uint32_t vkf = (lane % 4) * 4;
+        const uint32_t vd0 = (lane / 4) * 4;
+        uint32_t vpk[16];
+        {
+            f16vec4 vpre[8];
+            [[unroll]] for (uint32_t t = 0; t < 8; ++t) {
+                vpre[t] = data_vv4[v_offset / 4 + (j * Bc + 2 * vkf + t) * v_stride / 4 + (sg * DSL + vd0) / 4];
+            }
+            [[unroll]] for (uint32_t i = 0; i < 4; ++i) {
+                [[unroll]] for (uint32_t q = 0; q < 4; ++q) {
+                    vpk[i * 4 + q] = packFloat2x16(f16vec2(vpre[2 * q][i], vpre[2 * q + 1][i]));
+                }
+            }
+        }
+
+        // partial S^T over this subgroup's d slice
+        [[unroll]] for (uint32_t kt = 0; kt < Bc / 16; ++kt) {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> S0 =
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> S1 =
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+            [[unroll]] for (uint32_t ds = 0; ds < DSL / 16; ++ds) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> Kf;
+                coopMatLoad(Kf, data_kv4, k_offset / 4 + (j * Bc + kt * 16) * k_stride / 4 + (sg * DSL + ds * 16) / 4,
+                            k_stride / 4, gl_CooperativeMatrixLayoutRowMajor);
+                S0 = coopMatMulAdd(Kf, Qb[ds][0], S0);
+                S1 = coopMatMulAdd(Kf, Qb[ds][1], S1);
+            }
+            // S^T stored ColumnMajor = S row-major: element (key, row) -> slab[row * sstride + key]
+            coopMatStore(S0, ssh, sg * R * sstride + kt * 16, sstride, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatStore(S1, ssh, sg * R * sstride + 16 * sstride + kt * 16, sstride, gl_CooperativeMatrixLayoutColumnMajor);
+        }
+        barrier();
+
+        // sum the partial S, add the mask, online softmax of row my_r
+        float sv[KPL];
+        float mloc = NEG_FLT_MAX_OVER_2;
+        const bool rvalid = my_r < nrow;
+        [[unroll]] for (uint32_t k = 0; k < KPL; ++k) {
+            const uint32_t key = my_c * KPL + k;
+            float s = 0.0;
+            [[unroll]] for (uint32_t q = 0; q < NSG; ++q) {
+                s += ssh[q * R * sstride + my_r * sstride + key];
+            }
+            if (MASK_ENABLE) {
+                s += float(msh[min(my_r / G, 7u) * Bc + key]);
+            }
+            sv[k] = rvalid ? s : NEG_FLT_MAX_OVER_2;
+            mloc = max(mloc, sv[k]);
+        }
+        mloc = max(mloc, subgroupShuffleXor(mloc, 1));
+        mloc = max(mloc, subgroupShuffleXor(mloc, 2));
+        mloc = max(mloc, subgroupShuffleXor(mloc, 4));
+        mloc += FATTN_KQ_MAX_OFFSET;
+
+        const float Mnew = max(Mrow, mloc);
+        const float eM   = exp(Mrow - Mnew);
+        float lloc = 0.0;
+        [[unroll]] for (uint32_t k = 0; k < KPL; ++k) {
+            const float16_t pk = float16_t(exp(sv[k] - Mnew));
+            lloc += float(pk);
+            psh[my_r * pstride + my_c * KPL + k] = pk;
+        }
+        lloc += subgroupShuffleXor(lloc, 1);
+        lloc += subgroupShuffleXor(lloc, 2);
+        lloc += subgroupShuffleXor(lloc, 4);
+        Lrow = Lrow * eM + lloc;
+        Mrow = Mnew;
+        if (my_c == 0) {
+            eMsh[my_r] = eM;
+        }
+        const bool moved = subgroupAny(eM != 1.0);
+        if (lane == 0) {
+            movedsh[sg] = moved ? 1u : 0u;
+        }
+        barrier();
+
+        // V^T slice into the own slab (no other subgroup reads it after the barrier above)
+        [[unroll]] for (uint32_t i = 0; i < 4; ++i) {
+            [[unroll]] for (uint32_t q = 0; q < 4; ++q) {
+                ssh[sg * R * sstride + (vd0 + i) * (sstride / 2) + vkf + q] = uintBitsToFloat(vpk[i * 4 + q]);
+            }
+        }
+
+        // rescale O in registers, unless no row max moved
+        uint32_t any_moved = 0;
+        [[unroll]] for (uint32_t s = 0; s < NSG; ++s) {
+            any_moved |= movedsh[s];
+        }
+        if (any_moved != 0) {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> Ri;
+            coopMatLoad(Ri, rowidx, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+            [[unroll]] for (int e = 0; e < Ri.length(); ++e) {
+                const uint32_t rl = uint32_t(Ri[e]);
+                const float e0 = eMsh[rl];
+                const float e1 = eMsh[16 + rl];
+                [[unroll]] for (uint32_t c = 0; c < NDC; ++c) {
+                    O[0][c][e] *= e0;
+                    O[1][c][e] *= e1;
+                }
+            }
+        }
+
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+
+        // O[row x d slice] += P[row x key] * V[key x d slice]
+        [[unroll]] for (uint32_t bc = 0; bc < Bc / 16; ++bc) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> P0, P1;
+            coopMatLoad(P0, psh, bc * 16, pstride, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(P1, psh, 16 * pstride + bc * 16, pstride, gl_CooperativeMatrixLayoutRowMajor);
+            [[unroll]] for (uint32_t c = 0; c < NDC; ++c) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> Vb;
+                coopMatLoad(Vb, ssh, sg * R * sstride + c * 16 * (sstride / 2) + bc * 8, sstride / 2,
+                            gl_CooperativeMatrixLayoutColumnMajor);
+                O[0][c] = coopMatMulAdd(P0, Vb, O[0][c]);
+                O[1][c] = coopMatMulAdd(P1, Vb, O[1][c]);
+            }
+        }
+        barrier();
+    }
+
+    // store the split_k partials, staged 16x16 at a time through the slab
+    [[unroll]] for (uint32_t h = 0; h < 2; ++h) {
+        [[unroll]] for (uint32_t c = 0; c < NDC; ++c) {
+            coopMatStore(O[h][c], ssh, sg * R * sstride, 16, gl_CooperativeMatrixLayoutRowMajor);
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+            [[unroll]] for (uint32_t e = 0; e < 256 / SubGroupSize; ++e) {
+                const uint32_t idx = e * SubGroupSize + lane;
+                const uint32_t r   = h * 16 + idx / 16;
+                const uint32_t dl  = idx % 16;
+                if (r < nrow) {
+                    const uint32_t tok  = r / G;
+                    const uint32_t head = iq2 + r % G;
+                    const uint32_t o_off = HSV * p.ne1 * (split_k_index + p.k_num * (tok + p.ne2 * iq3));
+                    data_o[o_off + head * HSV + sg * DSL + c * 16 + dl] = D_TYPE(ssh[sg * R * sstride + idx]);
+                }
+            }
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+        }
+    }
+    if (my_c == 0 && my_r < nrow) {
+        const uint32_t tok  = my_r / G;
+        const uint32_t head = iq2 + my_r % G;
+        const uint32_t lm = HSV * p.ne1 * p.k_num * p.ne2 * p.ne3 + p.ne1 * 2 * (split_k_index + p.k_num * (tok + p.ne2 * iq3));
+        data_o[lm + head]         = D_TYPE(Lrow);
+        data_o[lm + p.ne1 + head] = D_TYPE(Mrow);
+    }
+}
+
+#else // !FA_DPART
 
 // These need to be supported N,M values for a MatBc x MatBr x 16 coopmatmuladd
 const uint32_t MatBr = 16;
@@ -661,3 +923,5 @@ void main() {
         }
     }
 }
+
+#endif // FA_DPART

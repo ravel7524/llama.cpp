@@ -2082,7 +2082,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     if (device->coopmat1_fa_support) {
         for (auto &fa : device->pipeline_flash_attn_f32_f16) {
-            if (fa.first.path != FA_COOPMAT1) continue;
+            if (fa.first.path != FA_COOPMAT1 && fa.first.path != FA_COOPMAT1_DPART) continue;
             const uint32_t Br = fa.first.Br;
             const uint32_t Bc = fa.first.Bc;
             const bool aligned = fa.first.aligned;
@@ -2095,7 +2095,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const void * spv_data;
             size_t spv_size;
             const char *name;
-            if (bf16_kv) {
+            if (fa.first.path == FA_COOPMAT1_DPART) {
+                GGML_ASSERT(f32acc && aligned && !bf16_kv);
+                spv_data = flash_attn_f32_f16_dpart_cm1_data;
+                spv_size = flash_attn_f32_f16_dpart_cm1_len;
+                name = "flash_attn_f32_f16_dpart_aligned_cm1";
+            } else if (bf16_kv) {
 #if defined(VK_KHR_shader_bfloat16) && defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
                 if (!device->coopmat_bf16_support) continue;
                 spv_data = flash_attn_f32_f16_bf16_cm1_data;
@@ -8106,6 +8111,21 @@ bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, const vk_
     return supported;
 }
 
+// Needs to be kept up to date with the FA_DPART mode of flash_attn_cm1.comp
+static bool ggml_vk_flash_attn_dpart_shmem_support(const vk_device& device) {
+    const uint32_t R = 32, Bc = 32, num_subgroups = 4;
+
+    const uint32_t ssh = num_subgroups * R * (Bc + 8) * sizeof(float);
+    const uint32_t psh = R * (Bc + 8) * sizeof(ggml_fp16_t);
+    const uint32_t row_state = R * sizeof(float) + num_subgroups * sizeof(uint32_t);
+    const uint32_t msh = 8 * Bc * sizeof(ggml_fp16_t);
+    const uint32_t rowidx = 16 * 16 * sizeof(float);
+    // DATA_A_IQ4_NL is compiled into the FA shaders unconditionally
+    const uint32_t iq_shmem = 16 * sizeof(ggml_fp16_t);
+
+    return ssh + psh + row_state + msh + rowidx + iq_shmem <= device->properties.limits.maxComputeSharedMemorySize;
+}
+
 void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
@@ -8279,11 +8299,30 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         aligned = false;
     }
 
+    // Small GQA batches (e.g. speculative decoding verify): one workgroup per KV head reads each K/V block once for all query tokens.
+    // The shader mode needs subgroup size 64; it is only tested on AMD.
+    static const bool enable_dpart = [] {
+        const char * env = getenv("GGML_VK_FA_DPART");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    const bool use_dpart = enable_dpart && tuning_params.path == FA_COOPMAT1 && ctx->device->vendor_id == VK_VENDOR_ID_AMD &&
+                           tuning_params.subgroup_size == 64 && !tuning_params.disable_subgroups &&
+                           gqa_ratio > 1 && neq1 >= 2 && neq1 * gqa_ratio <= 32 &&
+                           HSK == 256 && HSV == 256 && f32acc && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+                           mask != nullptr && nem3 <= 1 && sinks == nullptr && max_bias == 0.0f && logit_softcap == 0.0f && !use_sparse &&
+                           aligned && KV >= 2048 && ggml_vk_flash_attn_dpart_shmem_support(ctx->device);
+
     // Only use mask opt when the mask is fairly large. This hasn't been tuned extensively.
-    bool use_mask_opt = mask && !use_sparse && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
+    bool use_mask_opt = mask && !use_sparse && !use_dpart && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
                                                                    mask != nullptr, use_mask_opt, logit_softcap != 0, use_sparse, k_type_eff, v_type_eff);
+    if (use_dpart) {
+        fa_pipeline_state.path = FA_COOPMAT1_DPART;
+        fa_pipeline_state.Br = 32;
+        fa_pipeline_state.Bc = 32;
+        workgroups_x = 1;
+    }
 
     vk_pipeline pipeline = nullptr;
 
@@ -8350,6 +8389,10 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
             split_k = shader_core_count * 2 / total_wgs_no_split;
         }
     }
+    if (use_dpart) {
+        // the d-partitioned mode always writes split_k partials
+        split_k = std::max(split_k, 2u);
+    }
 
     if (!use_sparse && split_k > 1) {
         // Try to evenly split KV into split_k chunks, but it needs to be a multiple
@@ -8394,6 +8437,7 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
     if (xe_fa_opt == true) {
         use_mask_opt = false;
     }
+    GGML_ASSERT(!use_dpart || (split_k > 1 && !xe_fa_opt));
 
     // Reserve space for split_k temporaries. For each split x batch, we need to store the O matrix (D x ne1)
     // and the per-row m and L values (ne1 rows). We store all the matrices first, followed by the rows.
