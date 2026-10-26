@@ -411,6 +411,7 @@ enum FaCodePath {
     FA_SCALAR,
     FA_COOPMAT1,
     FA_COOPMAT2,
+    FA_COOPMAT1_GQA_PACK, // GQA-packed prefill mode of flash_attn_cm1.comp (FA_GQA_PACK)
 };
 
 struct vk_fa_pipeline_state {

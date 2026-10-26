@@ -8743,6 +8743,35 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     }
 };
 
+// causal mask of a prefill chunk at the end of the KV (query row i sees the keys <= kv - nb + i), so the masked-block
+// skipping sees fully visible, mixed and fully masked blocks as in a real prefill
+struct test_flash_attn_ext_causal : public test_flash_attn_ext {
+    using test_flash_attn_ext::test_flash_attn_ext;
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",causal=1";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        ggml_tensor * m = ggml_get_tensor(ctx, "m");
+        if (m == nullptr) {
+            return;
+        }
+        GGML_ASSERT(m->type == GGML_TYPE_F16 && ggml_is_contiguous(m) && m->ne[1] <= m->ne[0]);
+        const int64_t ne0 = m->ne[0];
+        const int64_t ne1 = m->ne[1];
+        std::vector<ggml_fp16_t> data(ggml_nelements(m));
+        for (int64_t r = 0; r < ggml_nrows(m); ++r) {
+            const int64_t last = ne0 - ne1 + r % ne1; // last visible key of this query row
+            for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                data[r*ne0 + i0] = ggml_fp32_to_fp16(i0 <= last ? 0.0f : -INFINITY);
+            }
+        }
+        ggml_backend_tensor_set(m, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -12236,6 +12265,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {4, 1},  4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
+    // GQA-packed prefill shapes (head size 256, GQA 4-6, nb >= 256; GQA 7 stays on the default path): KV not a multiple
+    // of the key block, token tails, random and causal masks, head-major and KV-cache (token-major) layouts, q8_0 K/V,
+    // no mask with two sequences
+    for (int nr2 : { 4, 5, 7 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {nr2, 1}, 4129, 300, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+    for (auto permute : { std::array<int32_t, 4>{0, 1, 2, 3}, std::array<int32_t, 4>{0, 2, 1, 3} }) {
+        for (int kv : { 4096, 4129 }) {
+            test_cases.emplace_back(new test_flash_attn_ext       (256, 256, 4, {6, 1}, kv, 300, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, permute, false));
+            test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, 4, {6, 1}, kv, 300, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, permute, false));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, 4, {6, 1}, 4096, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 2}, 1024, 256, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
     // dense-allocated (non-view) quant K/V at batch >= 64, in cache and native layouts
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {4, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
@@ -12834,6 +12879,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 65536, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    // prefill chunks in the KV-cache layout (token-major K/V), random and causal masks
+    for (int kv : { 4096, 32768, 131072 }) {
+        test_cases.emplace_back(new test_flash_attn_ext       (256, 256, 4, {6, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+        test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, 4, {6, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+    }
 
     for (int kv : { 4096, 8192, 16384,32768, 65536, }) {
         for (int hs : { 64, 128, 256, 512, 576, }) {

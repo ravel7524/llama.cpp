@@ -15,10 +15,13 @@
 #extension GL_KHR_shader_subgroup_vote : enable
 #extension GL_KHR_memory_scope_semantics : enable
 #extension GL_KHR_cooperative_matrix : enable
+#if defined(FA_GQA_PACK)
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#endif
 
 #include "types.glsl"
 #include "flash_attn_base.glsl"
-#if !defined(BFLOAT16)
+#if !defined(BFLOAT16) && !defined(FA_GQA_PACK)
 #include "flash_attn_dequant.glsl"
 #endif
 
@@ -38,6 +41,8 @@ layout (binding = 1) readonly buffer KV4 {FLOAT_TYPEV4 data_kv4[];};
 layout (binding = 2) readonly buffer V {FLOAT_TYPE data_v[];};
 layout (binding = 2) readonly buffer VV4 {FLOAT_TYPEV4 data_vv4[];};
 layout (binding = 3) readonly buffer M {float16_t data_m[];};
+
+#if !defined(FA_GQA_PACK)
 
 shared float tmpsh[row_split];
 
@@ -661,3 +666,313 @@ void main() {
         }
     }
 }
+
+#else // FA_GQA_PACK
+
+// GQA-packed mode for prefill (FA_GQA_PACK, f32 accumulation): one workgroup = one Br-token tile x one KV head.
+// It runs G = WorkGroupSize / SubGroupSize subgroups, and subgroup s owns Q head (kvh * G + s) for the tile's tokens.
+// Each Bc-key block of K and V is staged into shared memory once and shared by the G heads of the KV head, instead
+// of being read by G separate workgroups. Q (pre-scaled, f16) stays in B fragments for the whole KV loop and O in
+// f32 accumulators, so there are no per-block Q reloads and no output reduction. V is staged d-major (transposed),
+// so its B fragments load contiguously per lane.
+//
+// Supported shape (the host enforces it): HSK == HSV == 256, f16 K/V, f32 Q and dst, f32 accumulation, a subgroup
+// size of 64, no ALiBi, no logit softcap, no sinks, no sparse gather, no split_k, nem2 == nem3 == 1, Br 16, Bc 32.
+
+const uint32_t G   = WorkGroupSize / SubGroupSize;  // Q heads per KV head handled by this workgroup
+const uint32_t T   = Br;                            // tokens per tile (16)
+const uint32_t BC  = Bc;                            // keys per block (32)
+const uint32_t NDK = HSK / 16;                      // 16-wide d blocks of Q and K
+const uint32_t ND  = HSV / 16;                      // 16-wide d blocks of V and O
+
+const uint32_t KT = BC * HSK / 4;                   // K f16vec4 per block
+const uint32_t VT = BC / 4 * HSV / 4;               // V tasks (4 keys x 4 d) per block
+
+// K block, key-major: Bc rows x (HSK + 8 pad) halves. A fragments load RowMajor, contiguous per lane.
+const uint32_t KROW4 = (HSK + 8) / 4;
+shared f16vec4 ksh[BC * KROW4];
+
+// V block, d-major (transposed): HSV rows x (Bc + 8 pad) halves = 80 B rows, 16 B aligned.
+// B fragments (k = key, n = d) load ColumnMajor: each lane reads 16 contiguous keys of one d.
+const uint32_t VROW4 = (BC + 8) / 4;
+shared f16vec4 vtsh[HSV * VROW4];
+
+// Per-subgroup f32 slab: S^T (Bc keys x T tokens) in the loop, Q staging in the prologue,
+// partial-tile output staging in the epilogue.
+const uint32_t SLAB = BC * T;
+shared float ssh[G * SLAB];
+
+// Per-subgroup P (T tokens x Bc keys, f16), rows padded to 40 halves (80 B).
+const uint32_t PROW4 = (BC + 8) / 4;
+shared f16vec4 psh[G * T * PROW4];
+
+// Mask tile of the current block, shared by all heads (nem2 == 1): T tokens x Bc keys.
+shared float16_t msh[T * BC];
+
+// Row index of every accumulator element (element (r, c) = r). Lets a lane find which token row each
+// of its accumulator elements belongs to without assuming the driver's lane layout.
+shared float rowidx[16 * 16];
+
+void main() {
+    const uint32_t tid  = gl_LocalInvocationIndex;
+    const uint32_t sg   = gl_SubgroupID;
+    const uint32_t lane = gl_SubgroupInvocationID;
+
+    const uint32_t tile = gl_WorkGroupID.x;
+    const uint32_t kvh  = gl_WorkGroupID.y;
+    const uint32_t iq3  = gl_WorkGroupID.z;
+    const uint32_t t0   = tile * T;
+    const uint32_t h    = kvh * G + sg;
+
+    const uint32_t N  = p.N;
+    const uint32_t KV = p.KV;
+
+    const uint32_t ik3 = iq3 / (p.neq3 / p.nek3);
+    const uint32_t iv3 = iq3 / (p.neq3 / p.nev3);
+
+    // nb01/nb11/nb21 are in elements; nb02/nb03/nb12/nb13/nb22/nb23 are in bytes.
+    const uint32_t q_off    = (h * p.nb02 + iq3 * p.nb03) / 4;
+    const uint32_t q_stride = p.nb01;
+    const uint32_t k_off4   = (kvh * p.nb12 + ik3 * p.nb13) / 8;
+    const uint32_t k_str4   = p.nb11 / 4;
+    const uint32_t v_off4   = (kvh * p.nb22 + iv3 * p.nb23) / 8;
+    const uint32_t v_str4   = p.nb21 / 4;
+
+    [[unroll]] for (uint32_t it = 0; it < CEIL_DIV(16 * 16, WorkGroupSize); ++it) {
+        const uint32_t idx = it * WorkGroupSize + tid;
+        if (idx < 16 * 16) {
+            rowidx[idx] = float(idx / 16);
+        }
+    }
+
+    // ---- prologue: Q * scale -> f16 B fragments Q^T[d16 x tok16], staged through the slab so the
+    //      tail tile (t0 + T > N) reads no out-of-range rows.
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> Qf[NDK];
+    [[unroll]] for (uint32_t dp = 0; dp < NDK / 2; ++dp) {
+        // T tokens x 32 d = 512 floats, 8 per lane, slab[tok * 32 + d]
+        [[unroll]] for (uint32_t e = 0; e < SLAB / SubGroupSize; ++e) {
+            const uint32_t idx = e * SubGroupSize + lane;
+            const uint32_t tok = idx / 32;
+            const uint32_t d   = idx % 32;
+            ssh[sg * SLAB + idx] = (t0 + tok < N) ? data_q[q_off + (t0 + tok) * q_stride + dp * 32 + d] : 0.0;
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+        [[unroll]] for (uint32_t ds = 0; ds < 2; ++ds) {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> qt;
+            coopMatLoad(qt, ssh, sg * SLAB + ds * 16, 32, gl_CooperativeMatrixLayoutColumnMajor);
+            Qf[dp * 2 + ds] = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>(qt * p.scale);
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+    }
+    // rowidx is read by every subgroup, also when every K/V block of the tile is skipped
+    barrier();
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> O[ND];
+    [[unroll]] for (uint32_t i = 0; i < ND; ++i) {
+        O[i] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    }
+
+    // Softmax state for token my_t; lane holds keys my_c*8 .. my_c*8+7 of each block.
+    const uint32_t my_t = lane % 16;
+    const uint32_t my_c = lane / 16;
+    const float NEG_FLT_MAX_OVER_2 = uintBitsToFloat(0xFEFFFFFF);
+    float Mrow = NEG_FLT_MAX_OVER_2;
+    float Lrow = 0.0;
+
+    const uint32_t mo_stride = CEIL_DIV(KV, 16 * BC);
+    const uint32_t mo_offset = mo_stride * tile;
+    uint32_t mask_opt = 0;
+    uint32_t mask_opt_idx = ~0;
+
+    const uint32_t n_blocks = CEIL_DIV(KV, BC);
+
+    [[dont_unroll]]
+    for (uint32_t j = 0; j < n_blocks; ++j) {
+        uint32_t mask_opt_bits = 0;
+        if (MASK_ENABLE && USE_MASK_OPT) {
+            if (mask_opt_idx != j / 16) {
+                mask_opt_idx = j / 16;
+                mask_opt = data_mask_opt[mo_offset + mask_opt_idx];
+            }
+            mask_opt_bits = (mask_opt >> ((j % 16) * 2)) & 0x3;
+            if (mask_opt_bits == MASK_OPT_ALL_NEG_INF) {
+                continue;  // uniform across the workgroup: the mask is shared by all heads
+            }
+        }
+        const bool load_mask = MASK_ENABLE && mask_opt_bits != MASK_OPT_ALL_ZERO;
+
+        barrier();  // previous block's readers of ksh / vtsh / msh are done
+
+        // ---- stage K (key-major, coalesced rows); only the last, partial iteration needs the guard
+        [[unroll]] for (uint32_t it = 0; it < CEIL_DIV(KT, WorkGroupSize); ++it) {
+            const uint32_t idx = it * WorkGroupSize + tid;
+            if ((it + 1) * WorkGroupSize <= KT || idx < KT) {
+                const uint32_t r = idx / (HSK / 4);
+                const uint32_t c = idx % (HSK / 4);
+                const uint32_t key = j * BC + r;
+                f16vec4 kv = f16vec4(0);
+                if (!KV_bounds_check || key < KV) {
+                    kv = data_kv4[k_off4 + key * k_str4 + c];
+                }
+                ksh[r * KROW4 + c] = kv;
+            }
+        }
+
+        // ---- stage V transposed: a task = 4 keys x 4 d; 4 row loads, 4 b64 d-row writes.
+        //      The key quad varies fastest across lanes: d-rows sit 80 B apart, so lanes that differ
+        //      only in d would hit the same LDS bank pair (32-way); this order makes it 4-way.
+        [[unroll]] for (uint32_t it = 0; it < CEIL_DIV(VT, WorkGroupSize); ++it) {
+            const uint32_t task = it * WorkGroupSize + tid;
+            if ((it + 1) * WorkGroupSize <= VT || task < VT) {
+                const uint32_t kq = task % (BC / 4);
+                const uint32_t c  = task / (BC / 4);
+                f16vec4 v[4];
+                [[unroll]] for (uint32_t m = 0; m < 4; ++m) {
+                    const uint32_t key = j * BC + kq * 4 + m;
+                    v[m] = f16vec4(0);
+                    if (!KV_bounds_check || key < KV) {
+                        v[m] = data_vv4[v_off4 + key * v_str4 + c];
+                    }
+                }
+                [[unroll]] for (uint32_t e = 0; e < 4; ++e) {
+                    vtsh[(c * 4 + e) * VROW4 + kq] = f16vec4(v[0][e], v[1][e], v[2][e], v[3][e]);
+                }
+            }
+        }
+
+        // ---- mask tile (only diagonal / mixed blocks under mask_opt)
+        if (load_mask) {
+            [[unroll]] for (uint32_t it = 0; it < CEIL_DIV(T * BC, WorkGroupSize); ++it) {
+                const uint32_t idx = it * WorkGroupSize + tid;
+                if (idx < T * BC) {
+                    const uint32_t r = idx / BC;
+                    const uint32_t c = idx % BC;
+                    const uint32_t key = j * BC + c;
+                    float16_t mv = float16_t(0.0);
+                    if (t0 + r < p.nem1 && (!KV_bounds_check || key < KV)) {
+                        mv = data_m[(t0 + r) * KV + key];
+                    }
+                    msh[idx] = mv;
+                }
+            }
+        }
+
+        barrier();
+
+        // ---- S^T[key16 x tok16] = K[key16 x d] * Q^T[d x tok16]
+        [[unroll]] for (uint32_t kb = 0; kb < BC / 16; ++kb) {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> S =
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+            [[unroll]] for (uint32_t d = 0; d < NDK; ++d) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> Kf;
+                coopMatLoad(Kf, ksh, (kb * 16) * KROW4 + d * 4, KROW4, gl_CooperativeMatrixLayoutRowMajor);
+                S = coopMatMulAdd(Kf, Qf[d], S);
+            }
+            coopMatStore(S, ssh, sg * SLAB + kb * 256, T, gl_CooperativeMatrixLayoutRowMajor);
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+
+        // ---- mask + online softmax for token my_t over this lane's 8 keys
+        float sv[8];
+        float mloc = NEG_FLT_MAX_OVER_2;
+        [[unroll]] for (uint32_t k = 0; k < 8; ++k) {
+            const uint32_t key = my_c * 8 + k;
+            float s = ssh[sg * SLAB + key * T + my_t];
+            if (load_mask) {
+                s += float(msh[my_t * BC + key]);
+            }
+            if (KV_bounds_check && j * BC + key >= KV) {
+                s = uintBitsToFloat(0xFF800000);  // -inf: padded key
+            }
+            sv[k] = s;
+            mloc = max(mloc, s);
+        }
+        mloc = max(mloc, subgroupShuffleXor(mloc, 16));
+        mloc = max(mloc, subgroupShuffleXor(mloc, 32));
+
+        const float Mnew = max(Mrow, mloc);
+        const float eM   = exp(Mrow - Mnew);
+        float lloc = 0.0;
+        f16vec4 pa, pb;
+        [[unroll]] for (uint32_t k = 0; k < 4; ++k) {
+            pa[k] = float16_t(exp(sv[k]     - Mnew));
+            pb[k] = float16_t(exp(sv[k + 4] - Mnew));
+            lloc += float(pa[k]) + float(pb[k]);
+        }
+        psh[(sg * T + my_t) * PROW4 + my_c * 2 + 0] = pa;
+        psh[(sg * T + my_t) * PROW4 + my_c * 2 + 1] = pb;
+        lloc += subgroupShuffleXor(lloc, 16);
+        lloc += subgroupShuffleXor(lloc, 32);
+        Lrow = Lrow * eM + lloc;
+        Mrow = Mnew;
+
+        // ---- in-register O rescale, skipped when no row max moved
+        if (subgroupAny(eM != 1.0)) {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> R;
+            coopMatLoad(R, rowidx, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+            [[unroll]] for (int e = 0; e < R.length(); ++e) {
+                const float es = subgroupShuffle(eM, uint32_t(R[e]));
+                [[unroll]] for (uint32_t i = 0; i < ND; ++i) {
+                    O[i][e] *= es;
+                }
+            }
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+
+        // ---- O[tok16 x d] += P[tok16 x key32] * V[key32 x d]
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> P0, P1;
+        coopMatLoad(P0, psh, sg * T * PROW4 + 0, PROW4, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(P1, psh, sg * T * PROW4 + 4, PROW4, gl_CooperativeMatrixLayoutRowMajor);
+        [[unroll]] for (uint32_t i = 0; i < ND; ++i) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> V0, V1;
+            coopMatLoad(V0, vtsh, (i * 16) * VROW4 + 0, VROW4, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(V1, vtsh, (i * 16) * VROW4 + 4, VROW4, gl_CooperativeMatrixLayoutColumnMajor);
+            O[i] = coopMatMulAdd(P0, V0, O[i]);
+            O[i] = coopMatMulAdd(P1, V1, O[i]);
+        }
+    }
+
+    // ---- epilogue: O / L, dst[iq3][token][head][d]
+    const float Linv = (Lrow == 0.0) ? 0.0 : 1.0 / Lrow;
+    {
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> R;
+        coopMatLoad(R, rowidx, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+        [[unroll]] for (int e = 0; e < R.length(); ++e) {
+            const float s = subgroupShuffle(Linv, uint32_t(R[e]));
+            [[unroll]] for (uint32_t i = 0; i < ND; ++i) {
+                O[i][e] *= s;
+            }
+        }
+    }
+
+    const uint32_t o_row_stride = p.ne1 * HSV;  // floats between consecutive tokens
+    const uint32_t o_base = iq3 * p.ne2 * p.ne1 * HSV + t0 * o_row_stride + h * HSV;
+    if (t0 + T <= N) {
+        [[unroll]] for (uint32_t i = 0; i < ND; ++i) {
+            coopMatStore(O[i], data_o, o_base + i * 16, o_row_stride, gl_CooperativeMatrixLayoutRowMajor);
+        }
+    } else {
+        // tail tile: stage each 16x16 block through the slab and write only the valid tokens
+        [[unroll]] for (uint32_t i = 0; i < ND; ++i) {
+            coopMatStore(O[i], ssh, sg * SLAB, 16, gl_CooperativeMatrixLayoutRowMajor);
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+            [[unroll]] for (uint32_t e = 0; e < 256 / SubGroupSize; ++e) {
+                const uint32_t idx = e * SubGroupSize + lane;
+                const uint32_t tok = idx / 16;
+                const uint32_t d   = idx % 16;
+                if (t0 + tok < N) {
+                    data_o[o_base + tok * o_row_stride + i * 16 + d] = ssh[sg * SLAB + idx];
+                }
+            }
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+        }
+    }
+}
+
+#endif // FA_GQA_PACK

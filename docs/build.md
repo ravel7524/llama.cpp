@@ -433,6 +433,10 @@ On Linux it is possible to use unified memory architecture (UMA) to share main m
 
 ## Vulkan
 
+### Experimental flash attention
+
+`GGML_VK_FA_GQA_PACK=1` enables experimental GQA-packed CM1 prefill for eligible shapes on AMD devices with 64-lane subgroups. It is disabled when unset or `0`; existing shape and type checks still apply. Set it before launching applications or backend tests that should exercise the mode.
+
 ### For Windows Users:
 **w64devkit**
 

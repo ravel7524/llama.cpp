@@ -2082,7 +2082,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     if (device->coopmat1_fa_support) {
         for (auto &fa : device->pipeline_flash_attn_f32_f16) {
-            if (fa.first.path != FA_COOPMAT1) continue;
+            if (fa.first.path != FA_COOPMAT1 && fa.first.path != FA_COOPMAT1_GQA_PACK) continue;
             const uint32_t Br = fa.first.Br;
             const uint32_t Bc = fa.first.Bc;
             const bool aligned = fa.first.aligned;
@@ -2095,7 +2095,12 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const void * spv_data;
             size_t spv_size;
             const char *name;
-            if (bf16_kv) {
+            if (fa.first.path == FA_COOPMAT1_GQA_PACK) {
+                GGML_ASSERT(f32acc && !bf16_kv);
+                spv_data = flash_attn_f32_f16_gqa_pack_cm1_data;
+                spv_size = flash_attn_f32_f16_gqa_pack_cm1_len;
+                name = aligned ? "flash_attn_f32_f16_gqa_pack_aligned_cm1" : "flash_attn_f32_f16_gqa_pack_cm1";
+            } else if (bf16_kv) {
 #if defined(VK_KHR_shader_bfloat16) && defined(GGML_VULKAN_BFLOAT16_GLSLC_SUPPORT)
                 if (!device->coopmat_bf16_support) continue;
                 spv_data = flash_attn_f32_f16_bf16_cm1_data;
@@ -8269,6 +8274,45 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         nbv2_eff = (uint32_t)((uint64_t)HSV * KV * sizeof(ggml_fp16_t));
         nbv3_eff = (uint32_t)((uint64_t)HSV * KV * nev2 * sizeof(ggml_fp16_t));
     }
+
+    // GQA-packed prefill mode of the coopmat1 shader (FA_GQA_PACK): one workgroup = 16 tokens x one KV head, one
+    // wave64 subgroup per Q head, each K/V block staged once in shared memory for all Q heads of the KV head.
+    // It only takes the shape the mode supports and never splits K. GQA 4-6 only: 7 spills (the register cap of a
+    // 448-thread workgroup), 8 needs more than 64 KiB of shared memory, 2-3 are untested and run at low occupancy.
+    const uint32_t gqa_pack_shmem = 32 * (HSK + 8) * 2 + HSV * (32 + 8) * 2 + 16 * 32 * 2 + 16 * 16 * 4 +
+                                    qk_ratio * (32 * 16 * 4 + 16 * (32 + 8) * 2);
+    static const bool enable_gqa_pack = [] {
+        const char * env = getenv("GGML_VK_FA_GQA_PACK");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    const bool gqa_pack = enable_gqa_pack && tuning_params.path == FA_COOPMAT1 &&
+                          ctx->device->vendor_id == VK_VENDOR_ID_AMD &&
+                          ctx->device->subgroup_size == 64 &&
+                          gqa_ratio == 1 && N >= 256 &&
+                          qk_ratio >= 4 && qk_ratio <= 6 &&
+                          qk_ratio * nek2 == neq2 && nek2 == nev2 && neq3 == nek3 && nek3 == nev3 &&
+                          HSK == 256 && HSV == 256 &&
+                          k_type_eff == GGML_TYPE_F16 && v_type_eff == GGML_TYPE_F16 && f32acc &&
+                          nem2 <= 1 && nem3 <= 1 && sinks == nullptr &&
+                          max_bias == 0.0f && logit_softcap == 0.0f && !use_sparse &&
+                          k_stride % 4 == 0 && v_stride % 4 == 0 && (nbk2_eff | nbk3_eff | nbv2_eff | nbv3_eff) % 8 == 0 &&
+                          gqa_pack_shmem <= ctx->device->properties.limits.maxComputeSharedMemorySize &&
+                          qk_ratio * 64 <= ctx->device->properties.limits.maxComputeWorkGroupSize[0] &&
+                          qk_ratio * 64 <= ctx->device->properties.limits.maxComputeWorkGroupInvocations;
+    if (gqa_pack) {
+        tuning_params.path                  = FA_COOPMAT1_GQA_PACK;
+        tuning_params.block_rows            = 16;
+        tuning_params.block_cols            = 32;
+        tuning_params.d_split               = 1;
+        tuning_params.row_split             = 1;
+        tuning_params.subgroup_size         = 64;
+        tuning_params.workgroup_size        = qk_ratio * 64;
+        tuning_params.shmem_staging         = false;
+        tuning_params.disable_subgroups     = false;
+        tuning_params.limit_occupancy_shmem = 0;
+        workgroups_y = (uint32_t)nek2;
+    }
+
     const uint32_t alignment = tuning_params.block_cols;
     bool aligned = (KV % alignment) == 0 &&
                    // the "aligned" shader variant will forcibly align strides, for performance
@@ -8344,6 +8388,8 @@ void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const
         split_k = CEIL_DIV(total_blocks, per_blocks);
     } else if (gqa_ratio > 1 && workgroups_x <= Br) {
         split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
+    } else if (gqa_pack) {
+        // the GQA-packed mode has no split_k path
     } else if (gqa_ratio <= 1) {
         uint32_t total_wgs_no_split = Tr * workgroups_y * workgroups_z;
         if (total_wgs_no_split < shader_core_count * 2) {
