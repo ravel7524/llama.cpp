@@ -138,7 +138,12 @@ void rms_norm(uint num_iters) {
                     if (col >= ncols) {
                         continue;
                     }
+#ifdef RMS_NORM_SCALE_FUSION
+                    // fused GGML_OP_SCALE (factor in param2, no bias), applied to the normalized value as the separate op would
+                    data_d[d_offset + col] = D_TYPE((scale * FLOAT_TYPE(data_a[a_offset + col])) * FLOAT_TYPE(p.param2));
+#else
                     data_d[d_offset + col] = D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]));
+#endif
                 }
             }
 #if RMS_NORM_ROPE_FUSION

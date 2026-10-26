@@ -3257,6 +3257,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_group_norm_f32, "group_norm_f32", group_norm_f32_len, group_norm_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_f32, "rms_norm_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_rms_norm_scale_f32, "rms_norm_scale_f32", rms_norm_scale_f32_len, rms_norm_scale_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_f32, "rms_norm_mul_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_f32, "rms_norm_mul_add_f32", rms_norm_mul_add_f32_len, rms_norm_mul_add_f32_data, "main", 5, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 0}, 1, true);
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_add_mul_f32, "rms_norm_mul_add_mul_f32", rms_norm_mul_add_f32_len, rms_norm_mul_add_f32_data, "main", 5, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1, 1}, 1, true);
@@ -8980,6 +8981,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             if (ctx->do_add_rms_partials) {
                 return ctx->fused_rms_norm_mode == RMS_NORM_MUL ? ctx->device->pipeline_rms_norm_mul_partials_f32 : ctx->device->pipeline_rms_norm_partials_f32;
             }
+            if (ctx->fused_rms_norm_mode == RMS_NORM_SCALE) {
+                return ctx->device->pipeline_rms_norm_scale_f32;
+            }
             return ctx->fused_rms_norm_mode == RMS_NORM_MUL ? ctx->device->pipeline_rms_norm_mul_f32 : ctx->device->pipeline_rms_norm_f32;
         }
         return nullptr;
@@ -10977,7 +10981,10 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
     ggml_tensor * dst;
     const ggml_tensor * src1;
 
-    if (ctx->fused_rms_norm_mode != RMS_NORM_COUNT) {
+    if (ctx->fused_rms_norm_mode == RMS_NORM_SCALE) {
+        dst = cgraph->nodes[node_idx + 1];
+        src1 = src0;
+    } else if (ctx->fused_rms_norm_mode != RMS_NORM_COUNT) {
         ggml_tensor * mul = cgraph->nodes[node_idx + 1];
         dst = mul;
         src1 = mul->src[0] == rms ? mul->src[1] : mul->src[0];
@@ -10988,6 +10995,10 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
 
     const uint32_t num_partials = ctx->do_add_rms_partials ? ggml_vk_rms_num_partials(ctx, dst) : 0;
     vk_op_binary_push_constants bin = ggml_vk_rms_norm_push_constants(src0, src1, dst, op_params[0], num_partials);
+    if (ctx->fused_rms_norm_mode == RMS_NORM_SCALE) {
+        GGML_ASSERT(ctx->num_additional_fused_ops == 1 && num_partials == 0);
+        bin.param2 = ggml_get_op_params_f32(dst, 0); // the fused scale factor
+    }
 
     if (ctx->fused_rms_norm_mode == RMS_NORM_MUL_ROPE ||
         ctx->fused_rms_norm_mode == RMS_NORM_MUL_ROPE_VIEW_SET_ROWS) {
@@ -11070,7 +11081,8 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
                 ggml_vk_subbuffer(ctx, buf[6], offset[6]),
             }, pc, elements);
     } else {
-        GGML_ASSERT(ctx->fused_rms_norm_mode == RMS_NORM_MUL || ctx->fused_rms_norm_mode == RMS_NORM_COUNT);
+        GGML_ASSERT(ctx->fused_rms_norm_mode == RMS_NORM_MUL || ctx->fused_rms_norm_mode == RMS_NORM_SCALE ||
+                    ctx->fused_rms_norm_mode == RMS_NORM_COUNT);
         ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_RMS_NORM, std::move(bin));
     }
 
@@ -14093,6 +14105,19 @@ bool ggml_vk_can_fuse_topk_qsa(ggml_backend_vk_context * ctx, const struct ggml_
     return true;
 }
 
+// RMS_NORM + SCALE, e.g. the l2 norm of gated delta net models (build_gdn_l2_norm)
+static bool ggml_vk_can_fuse_rms_norm_scale(const ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_vk_can_fuse(ctx, cgraph, node_idx, { GGML_OP_RMS_NORM, GGML_OP_SCALE })) {
+        return false;
+    }
+    const ggml_tensor * rms   = cgraph->nodes[node_idx];
+    const ggml_tensor * scale = cgraph->nodes[node_idx + 1];
+    // the shader takes the factor only (no bias), writes contiguous rows and has no partials variant
+    return scale->src[0] == rms && rms->src[0]->type == GGML_TYPE_F32 && rms->type == GGML_TYPE_F32 &&
+           scale->type == GGML_TYPE_F32 && ggml_get_op_params_f32(scale, 1) == 0.0f && ggml_is_contiguous(scale) &&
+           !ctx->do_add_rms_partials;
+}
+
 bool ggml_vk_can_fuse_rope_set_rows(ggml_backend_vk_context * ctx, const struct ggml_cgraph * cgraph,
                                            int node_idx) {
     const ggml_tensor *rope = cgraph->nodes[node_idx + 0];
@@ -14583,6 +14608,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 // they are overwritten, and one workgroup per row. So close enough.
                 op_srcs_fused_elementwise[0] = true;
                 op_srcs_fused_elementwise[1] = true;
+            } else if (ggml_vk_can_fuse_rms_norm_scale(ctx, cgraph, i)) {
+                ctx->num_additional_fused_ops = 1;
+                ctx->fused_rms_norm_mode = RMS_NORM_SCALE;
+                fusion_string = "RMS_NORM_SCALE";
+                // as RMS_NORM_MUL: whole rows are consumed before they are overwritten, one workgroup per row
+                op_srcs_fused_elementwise[0] = true;
+                op_srcs_fused_elementwise[1] = true;
             } else if (ggml_vk_can_fuse(ctx, cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL })) {
                 ctx->num_additional_fused_ops = 1;
                 switch (ggml_get_unary_op(cgraph->nodes[i])) {
@@ -14925,6 +14957,31 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
             return false;
         };
 
+        auto const &in_set = [&](const std::vector<int> &set, const ggml_tensor * t) -> bool {
+            for (int c : set) {
+                if (graph->nodes[c] == t) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        // true if the UNARY at u has a fusable MUL that still waits for its other operand: grabbing the UNARY now would split the fusion
+        auto const &unary_mul_partner_waits = [&](const std::vector<int> &set, int u) -> bool {
+            for (int k = u + 1; k < std::min(u + 15, graph->n_nodes); ++k) {
+                ggml_tensor * mul = graph->nodes[k];
+                if (used[k] || mul->op != GGML_OP_MUL || (mul->src[0] != graph->nodes[u] && mul->src[1] != graph->nodes[u])) {
+                    continue;
+                }
+                if (!ggml_vk_can_fuse_unary_mul(graph, u, k)) {
+                    continue;
+                }
+                ggml_tensor * other = (mul->src[0] == graph->nodes[u]) ? mul->src[1] : mul->src[0];
+                return !(other->op == GGML_OP_NONE || used_node_set.find(other) != used_node_set.end() || in_set(set, other));
+            }
+            return false;
+        };
+
         auto const &add_pattern_alloc_deps = [&](const std::initializer_list<ggml_op> &pattern, int last_node) {
             // Keep external inputs alive through the fused output.
             std::set<ggml_tensor *> seen;
@@ -15026,6 +15083,10 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 }
                 return false;
             };
+            // keep a UNARY next to its MUL (UNARY + MUL fusion): defer it while the MUL still waits for its other operand
+            if (graph->nodes[j]->op == GGML_OP_UNARY && unary_mul_partner_waits(current_set, j)) {
+                continue;
+            }
             if (match_pattern(topk_moe_early_softmax_norm, j) ||
                 match_pattern(topk_moe_sigmoid_norm_bias, j) ||
                 match_pattern(topk_moe_sqrt_softplus_norm_bias, j) ||
@@ -15046,6 +15107,7 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                 if (!used[c] &&
                     is_src_of(graph->nodes[j], graph->nodes[c]) &&
                     !(c == current_set.back() && graph->nodes[c]->op == GGML_OP_RMS_NORM && graph->nodes[j]->op == GGML_OP_MUL && empty_or_scheduled_between(c+1, j)) &&
+                    !(c == current_set.back() && graph->nodes[c]->op == GGML_OP_RMS_NORM && graph->nodes[j]->op == GGML_OP_SCALE && empty_or_scheduled_between(c+1, j)) &&
                     !(c == current_set.back() && graph->nodes[c]->op == GGML_OP_UNARY && graph->nodes[j]->op == GGML_OP_MUL && empty_or_scheduled_between(c+1, j)) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT && graph->nodes[j]->op == GGML_OP_ADD) &&
                     !(j == c+1 && c == current_set.back() && graph->nodes[c]->op == GGML_OP_MUL_MAT_ID && graph->nodes[j]->op == GGML_OP_ADD_ID) &&
@@ -15168,12 +15230,21 @@ void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * graph, 
                             continue;
                         }
                         ggml_tensor * other = (mul->src[0] == graph->nodes[j]) ? mul->src[1] : mul->src[0];
-                        // the other src must either be weights or already processed
-                        if (!(other->op == GGML_OP_NONE || used_node_set.find(other) != used_node_set.end())) {
+                        // the other src must either be weights, already processed or in the current set
+                        if (!(other->op == GGML_OP_NONE || used_node_set.find(other) != used_node_set.end() ||
+                              in_set(current_set, other))) {
                             continue;
                         }
                         if (!ggml_vk_can_fuse_unary_mul(graph, j, k)) {
                             continue;
+                        }
+                        // the MUL moves ahead of the unscheduled nodes before it that are not in this set: none of them may write what it reads or read what it writes
+                        bool hazard = false;
+                        for (int c = first_unused; c < k && !hazard; ++c) {
+                            hazard = !used[c] && !in_set(current_set, graph->nodes[c]) && is_src_of(mul, graph->nodes[c]);
+                        }
+                        if (hazard) {
+                            break;
                         }
                         current_set.push_back(k);
                         used[k] = true;

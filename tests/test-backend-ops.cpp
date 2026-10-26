@@ -1217,6 +1217,39 @@ static bool backend_lacks_skipped_ids(ggml_backend_t backend, ggml_cgraph * gf) 
     return false;
 }
 
+// Compute graph on backend1 through ggml_backend_sched, which also runs the backend's graph_optimize (node reordering),
+// and the original graph order on backend2; then compare the test nodes.
+static bool compare_graph_sched(ggml_backend_t backend1, ggml_backend_t backend2, ggml_cgraph * graph,
+        ggml_backend_eval_callback callback, void * user_data, const std::vector<ggml_tensor *> & test_nodes) {
+    struct ggml_backend_graph_copy copy = ggml_backend_graph_copy(backend2, graph);
+    if (copy.buffer == NULL) {
+        return false;
+    }
+    ggml_backend_graph_compute(backend2, copy.graph);
+
+    // pair the test nodes with their copies through the original node order (the scheduler may reorder the graph)
+    std::vector<std::pair<ggml_tensor *, ggml_tensor *>> pairs;
+    for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
+        ggml_tensor * t = ggml_graph_node(graph, i);
+        if (std::find(test_nodes.begin(), test_nodes.end(), t) != test_nodes.end()) {
+            pairs.emplace_back(t, ggml_graph_node(copy.graph, i));
+        }
+    }
+
+    ggml_backend_t backends[2] = { backend1, backend2 };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, NULL, 2, ggml_graph_size(graph), false, false);
+    const bool ok = ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS;
+    ggml_backend_sched_synchronize(sched);
+
+    for (size_t i = 0; ok && i < pairs.size(); i++) {
+        callback((int) i, pairs[i].first, pairs[i].second, user_data);
+    }
+    const bool verified = !pairs.empty();
+    ggml_backend_sched_free(sched);
+    ggml_backend_graph_copy_free(copy);
+    return ok && verified;
+}
+
 struct test_case {
     virtual ~test_case() {}
 
@@ -1314,6 +1347,14 @@ struct test_case {
 
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
+    // run backend1 through ggml_backend_sched, so that graph_optimize reorders the graph (needs run_whole_graph)
+    virtual bool run_graph_optimize() { return false; }
+    // with run_graph_optimize: check the node order graph_optimize produced (the scheduler reorders the graph in place)
+    virtual bool check_graph_order(ggml_backend_t backend, ggml_cgraph * graph) {
+        GGML_UNUSED(backend);
+        GGML_UNUSED(graph);
+        return true;
+    }
     virtual bool use_weight_context() { return false; }
 
     ggml_cgraph * gf = nullptr;
@@ -1584,13 +1625,21 @@ struct test_case {
         if (fused_nodes_to_verify.size() == 0 && run_whole_graph()) {
             fused_nodes_to_verify.push_back(out);
         }
-        const bool cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud,
-                                                               run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
-                                                               fused_nodes_to_verify.size());
+        const bool sched_cmp = run_whole_graph() && run_graph_optimize() &&
+                               ggml_backend_dev_type(ggml_backend_get_device(backend1)) != GGML_BACKEND_DEVICE_TYPE_CPU;
+        const bool cmp_ok = sched_cmp ? compare_graph_sched(backend1, backend2, gf, callback, &ud, fused_nodes_to_verify)
+                                      : ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud,
+                                                                           run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
+                                                                           fused_nodes_to_verify.size());
+
+        const bool order_ok = !sched_cmp || check_graph_order(backend1, gf);
+        if (!order_ok) {
+            printf("[%s] unexpected node order after graph_optimize ", op_desc(out).c_str());
+        }
 
         // Create test result
-        bool        test_passed = ud.ok && cmp_ok;
-        std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : "test failed");
+        bool        test_passed = ud.ok && cmp_ok && order_ok;
+        std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : (!order_ok ? "node order" : "test failed"));
         test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", supported, test_passed,
                            error_msg);
 
@@ -3867,17 +3916,23 @@ struct test_norm_scale : public test_case {
     const float eps;
     const bool rms;
     const float scale;
+    const float bias; // a scale with a bias must not take the fused path
 
     std::string vars() override {
-        return VARS_TO_STR5(type, ne, eps, rms, scale);
+        std::string v = VARS_TO_STR5(type, ne, eps, rms, scale);
+        if (bias != 0.0f) {
+            v += "," + VAR_TO_STR(bias);
+        }
+        return v;
     }
 
     test_norm_scale(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {64, 5, 4, 3},
             float eps = 1e-6f,
             bool rms = false,
-            float scale = 1.5f)
-        : type(type), ne(ne), eps(eps), rms(rms), scale(scale) {}
+            float scale = 1.5f,
+            float bias = 0.0f)
+        : type(type), ne(ne), eps(eps), rms(rms), scale(scale), bias(bias) {}
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -3891,7 +3946,7 @@ struct test_norm_scale : public test_case {
         ggml_set_name(a, "a");
 
         ggml_tensor * n = rms ? ggml_rms_norm(ctx, a, eps) : ggml_norm(ctx, a, eps);
-        ggml_tensor * out = ggml_scale(ctx, n, scale);
+        ggml_tensor * out = bias != 0.0f ? ggml_scale_bias(ctx, n, scale, bias) : ggml_scale(ctx, n, scale);
         ggml_set_name(out, "out");
 
         return out;
@@ -4227,6 +4282,68 @@ struct test_relu_sqr : public test_case {
 };
 
 // GGML_OP_UNARY(GELU|SILU|SIGMOID|SOFTPLUS) + GGML_OP_MUL (fused operation).
+// graph_optimize must not move the MUL of a UNARY + MUL pair ahead of an in-place update of its other operand
+struct test_unary_mul_order : public test_case {
+    const std::array<int64_t, 4> ne;
+    const bool update; // false: the same graph without the in-place update (the pair may be fused)
+
+    ggml_tensor * unary_node = nullptr;
+    ggml_tensor * first_node = nullptr;
+    ggml_tensor * mul_node   = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "UNARY_MUL_ORDER";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, update);
+    }
+
+    bool run_whole_graph() override { return true; }
+    bool run_graph_optimize() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { mul_node }; }
+
+    test_unary_mul_order(std::array<int64_t, 4> ne = {128, 4, 1, 1}, bool update = true)
+        : ne(ne), update(update) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * y = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * z = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(x, "x");
+        ggml_set_name(y, "y");
+        ggml_set_name(z, "z");
+
+        ggml_tensor * b = ggml_scale(ctx, x, 2.0f);
+        first_node = update ? ggml_add_inplace(ctx, b, y) : ggml_add(ctx, b, y);
+        unary_node = ggml_silu(ctx, z);
+        mul_node = ggml_mul(ctx, unary_node, b);
+        ggml_set_name(mul_node, "mul");
+        // the first operand comes first in graph order: b, the update of b, then the MUL that reads b
+        return ggml_add(ctx, ggml_sum(ctx, first_node), ggml_sum(ctx, mul_node));
+    }
+
+    bool check_graph_order(ggml_backend_t backend, ggml_cgraph * graph) override {
+        int i_unary = -1, i_first = -1, i_mul = -1;
+        for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
+            const ggml_tensor * t = ggml_graph_node(graph, i);
+            i_unary = t == unary_node ? i : i_unary;
+            i_first = t == first_node ? i : i_first;
+            i_mul   = t == mul_node   ? i : i_mul;
+        }
+        if (update) {
+            // any backend: the MUL must stay behind the in-place update of its operand
+            return i_first < i_mul;
+        }
+        // Vulkan's graph_optimize pulls the MUL right behind its UNARY, so that the pair fuses
+        if (strncmp(ggml_backend_name(backend), "Vulkan", 6) == 0) {
+            return i_mul == i_unary + 1;
+        }
+        return true;
+    }
+};
+
 struct test_unary_mul : public test_case {
     const ggml_unary_op op;
     const ggml_type type;
@@ -10015,6 +10132,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_relu_sqr(type, { 5, 7, 11, 13 }));
     }
 
+    // graph_optimize must keep the MUL behind an in-place update of its other operand
+    test_cases.emplace_back(new test_unary_mul_order({ 128, 4, 1, 1 }, true));
+    test_cases.emplace_back(new test_unary_mul_order({ 128, 4, 1, 1 }, false));
+
     // fused unary + mul (gated activations that are not expressed as GGML_OP_GLU)
     for (ggml_unary_op op : { GGML_UNARY_OP_GELU, GGML_UNARY_OP_SILU, GGML_UNARY_OP_RELU, GGML_UNARY_OP_SIGMOID, GGML_UNARY_OP_SOFTPLUS }) {
         for (ggml_type type : { GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16 }) {
@@ -10866,6 +10987,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, false, eps, true));
             test_cases.emplace_back(new test_norm_scale(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false, 1.5f));
             test_cases.emplace_back(new test_norm_scale(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true, 1.5f));
+            test_cases.emplace_back(new test_norm_scale(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true, 1.5f, 0.25f));
             test_cases.emplace_back(new test_rms_norm_back(GGML_TYPE_F32, { n, 5, 4, 3 }, eps));
             test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, false));
             test_cases.emplace_back(new test_l2_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, eps, true));
@@ -10882,6 +11004,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, v, eps));
             }
         }
+    }
+
+    // the GDN l2 norm (build_gdn_l2_norm, qwen35: head 128, 16 key heads, 1 and 4 tokens): eps/n and 1/sqrt(n)
+    for (int64_t n_tok : { 1, 4 }) {
+        test_cases.emplace_back(new test_norm_scale(GGML_TYPE_F32, { 128, 16, n_tok, 1 }, 1e-6f/128, true, 1.0f/sqrtf(128.0f)));
     }
 
     // in-place tests
