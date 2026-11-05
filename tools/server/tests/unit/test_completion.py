@@ -1,6 +1,7 @@
 import pytest
 import requests
 import time
+import re
 import random
 
 from openai import OpenAI
@@ -772,3 +773,156 @@ def test_completion_checkpoint_kept_after_restore():
     for suffix in suffixes[1:]:
         assert len(suffix) > server.n_ubatch + 4
         assert cache_n(prefix + suffix) == len(prefix) - 1
+
+
+# a prompt cache entry whose context checkpoints do not fit in --cache-ram keeps its newest checkpoints instead of being
+# skipped, so a follow-up after a displacement resumes from a checkpoint instead of re-processing the whole prompt
+def test_completion_checkpoints_trimmed_to_cache_ram(tmp_path):
+    global server
+
+    def run(cache_ram):
+        global server
+        server = ServerPreset.tinygemma3()
+        server.n_slots = 1
+        server.n_batch = 32
+        server.n_ubatch = 32
+        server.cache_ram = cache_ram
+        server.temperature = 0.0
+        server.debug = True
+        server.log_path = str(tmp_path / f"server-{cache_ram}.log")
+        server.start()
+
+        def tokenize(content):
+            res = server.make_request("POST", "/tokenize", data={"content": content})
+            assert res.status_code == 200
+            return res.body["tokens"]
+
+        def complete(prompt):
+            res = server.make_request("POST", "/completion", data={
+                "prompt": prompt,
+                "n_predict": 4,
+                "n_probs": 5,
+                "cache_prompt": True,
+                "return_tokens": True,
+            })
+            assert res.status_code == 200
+            return res.body
+
+        out = {}
+        older = tokenize("Purple elephants quietly compose sonnets about tax law in the moonlight")
+        complete(older)
+
+        # each turn adds context checkpoints: the conversation fits the cache only without its older checkpoints
+        conv = tokenize("Once upon a time in a land far away, there lived a brave knight who traveled across the mountains")
+        for day in range(1, 9):
+            res = complete(conv)
+            conv = conv + res["tokens"] + tokenize(f" Then, on day {day}, the knight met a dragon.")
+
+        # an unrelated prompt moves the conversation from the slot to the prompt cache
+        complete(tokenize("The quick brown fox jumps over the lazy dog while the farmer counts his sheep"))
+        conv_next = conv + tokenize(" The knight finally reached the castle gates.")
+        out["next"] = complete(conv_next)
+
+        # again, then a prompt that diverges before the end of the cached one: rolls back to a checkpoint of the entry
+        complete(tokenize("Seven tiny robots repaired the broken lighthouse lens before the storm arrived"))
+        out["div"] = complete(conv_next[:-12] + tokenize(" The dragon ate the knight."))
+
+        # the older entry is still cached: the trimmed entry did not take its space
+        out["older"] = complete(older + tokenize(" and nobody ever read them."))
+
+        server.stop()
+        with open(server.log_path) as f:
+            return out, f.read(), len(conv_next)
+
+    ref, log_ref, n_next = run(256)  # every entry fits with all its checkpoints
+    assert "trimming" not in log_ref
+    assert ref["next"]["timings"]["prompt_n"] < n_next // 4
+
+    out, log, _ = run(14)
+
+    for key in ["next", "div", "older"]:
+        # the same tokens were reused and evaluated as with the whole entry, and the results are identical
+        assert out[key]["timings"]["cache_n"] == ref[key]["timings"]["cache_n"], key
+        assert out[key]["timings"]["prompt_n"] == ref[key]["timings"]["prompt_n"], key
+        assert out[key]["tokens"] == ref[key]["tokens"], key
+        assert out[key]["completion_probabilities"] == ref[key]["completion_probabilities"], key
+
+    assert re.search(r"trimming \d+ oldest context checkpoints", log)
+    assert "exceeds cache size limit" not in log
+    sizes = [float(s) for s in re.findall(r"cache state: \d+ prompts, ([0-9.]+) MiB", log)]
+    assert sizes and max(sizes) <= 14.0
+
+
+
+# a trimmed entry keeps at least its newest checkpoint: when even that does not fit next to the base state (the base state
+# alone takes more than half of the cache), the entry is skipped as before and evicts nothing
+def test_completion_checkpoints_trim_keeps_one_or_skips(tmp_path):
+    global server
+
+    def run(cache_ram):
+        global server
+        server = ServerPreset.tinygemma3()
+        server.n_slots = 1
+        server.n_batch = 32
+        server.n_ubatch = 32
+        server.cache_ram = cache_ram
+        server.temperature = 0.0
+        server.debug = True
+        server.log_path = str(tmp_path / f"server-{cache_ram}.log")
+        server.start()
+
+        def tokenize(content):
+            res = server.make_request("POST", "/tokenize", data={"content": content})
+            assert res.status_code == 200
+            return res.body["tokens"]
+
+        def complete(prompt):
+            res = server.make_request("POST", "/completion", data={
+                "prompt": prompt,
+                "n_predict": 4,
+                "n_probs": 5,
+                "cache_prompt": True,
+                "return_tokens": True,
+            })
+            assert res.status_code == 200
+            return res.body
+
+        out = {}
+        older = tokenize("Purple elephants quietly compose sonnets about tax law in the moonlight, while seven tiny robots "
+                         "repair the broken lighthouse lens before the storm arrives and green apples roll down the hill "
+                         "toward the river, where a curious otter collects them one by one and stacks them on a flat stone")
+        complete(older)
+
+        conv = tokenize("Once upon a time in a land far away, there lived a brave knight who traveled across the mountains")
+        for day in range(1, 9):
+            res = complete(conv)
+            conv = conv + res["tokens"] + tokenize(f" Then, on day {day}, the knight met a dragon.")
+
+        # an unrelated prompt moves the conversation from the slot to the prompt cache
+        complete(tokenize("The quick brown fox jumps over the lazy dog while the farmer counts his sheep"))
+        out["next"] = complete(conv + tokenize(" The knight finally reached the castle gates."))
+        out["older"] = complete(older + tokenize(" and nobody ever read them."))
+
+        server.stop()
+        with open(server.log_path) as f:
+            return out, f.read(), len(older)
+
+    ref, log_ref, n_older = run(256)  # every entry fits with all its checkpoints
+    assert "trimming" not in log_ref
+    assert ref["next"]["timings"]["cache_n"] > 0
+    assert ref["older"]["timings"]["cache_n"] > n_older // 2
+
+    # 3 MiB: the older entry fits, the conversation's base state fits only without it and leaves no room for a checkpoint
+    out, log, _ = run(3)
+
+    for key in ["next", "older"]:
+        assert out[key]["tokens"] == ref[key]["tokens"], key
+        assert out[key]["completion_probabilities"] == ref[key]["completion_probabilities"], key
+
+    # the older entry kept its place, and the conversation was skipped
+    assert out["older"]["timings"]["cache_n"] == ref["older"]["timings"]["cache_n"]
+    assert out["older"]["timings"]["prompt_n"] == ref["older"]["timings"]["prompt_n"]
+    assert out["next"]["timings"]["cache_n"] == 0
+    assert re.search(r"with its newest context checkpoint does not fit the cache size limit", log)
+    sizes = [float(s) for s in re.findall(r"cache state: \d+ prompts, ([0-9.]+) MiB", log)]
+    assert sizes and max(sizes) <= 3.0

@@ -1770,14 +1770,20 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         checkpoints_size += ckpt->size();
     }
 
-    const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
+    const size_t state_size_base = state_size_tgt + state_size_dft;
+
+    size_t state_size_new = state_size_base + checkpoints_size;
 
     // skip over-limit entries to avoid disturbing the cache
-    if (limit_size > 0 && state_size_new > limit_size) {
+    if (limit_size > 0 && state_size_base > limit_size) {
         SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
-                state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+                state_size_base / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
         return nullptr;
     }
+
+    // a follow-up resumes from the base state or from the newest checkpoints, the ones closest to the end of the cached
+    // prompt, so when not all checkpoints fit, store the entry with its newest checkpoints that fit instead of skipping it
+    const bool trim = limit_size > 0 && state_size_new > limit_size;
 
     // remove any cached prompts that are fully contained in the current prompt
     for (auto it = states.begin(); it != states.end();) {
@@ -1790,6 +1796,51 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         } else {
             ++it;
         }
+    }
+
+    size_t n_ckpt_drop = 0;
+    if (trim) {
+        // only the base state may evict other entries: count the oldest entries it would evict
+        size_t size_left = size();
+        size_t n_evict   = 0;
+        for (auto it = states.begin(); it != states.end() && size_left + state_size_base > limit_size; ++it) {
+            size_left -= it->size();
+            n_evict++;
+        }
+
+        // the checkpoints get the space that is left, but a trimmed entry takes at most half of the cache: an entry that
+        // fills the cache is the first one evicted by the next save, which would lose it together with the older entries
+        const size_t free_left = limit_size - size_left - state_size_base;
+        const size_t half_left = limit_size / 2 > state_size_base ? limit_size / 2 - state_size_base : 0;
+        const size_t budget    = std::min(free_left, half_left);
+
+        size_t kept   = 0;
+        size_t n_keep = 0;
+        for (auto it = prompt.checkpoints.rbegin(); it != prompt.checkpoints.rend() && kept + (*it)->size() <= budget; ++it) {
+            kept += (*it)->size();
+            n_keep++;
+        }
+
+        // without a checkpoint, a follow-up that diverges from the cached prompt (on SWA memory, any follow-up) re-processes
+        // it from the start, so such an entry is not worth evicting others for: skip it, as when nothing is trimmed
+        if (n_keep == 0) {
+            SRV_WRN(" - prompt state size %.3f MiB with its newest context checkpoint does not fit the cache size limit %.3f MiB, skipping\n",
+                    (state_size_base + prompt.checkpoints.back()->size()) / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+            return nullptr;
+        }
+
+        for (size_t i = 0; i < n_evict; i++) {
+            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
+                    states.front().size() / (1024.0 * 1024.0));
+
+            states.pop_front();
+        }
+
+        n_ckpt_drop    = prompt.checkpoints.size() - n_keep;
+        state_size_new = state_size_base + kept;
+
+        SRV_WRN(" - trimming %zu oldest context checkpoints (%.3f MiB) to fit the cache size limit %.3f MiB\n",
+                n_ckpt_drop, (checkpoints_size - kept) / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
     }
 
     if (limit_size > 0) {
@@ -1824,7 +1875,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     states.push_back({
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ prompt.checkpoints,
+            /*.checkpoints =*/ std::list<std::shared_ptr<const common_prompt_checkpoint>>(std::next(prompt.checkpoints.begin(), n_ckpt_drop), prompt.checkpoints.end()),
         },
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
